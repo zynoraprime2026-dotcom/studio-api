@@ -18,6 +18,33 @@ const WORK_DIR = process.env.WORK_DIR || path.join(os.tmpdir(), 'studio-api');
 const VIDEOS_DIR = path.join(WORK_DIR, 'videos');
 fs.mkdirSync(VIDEOS_DIR, { recursive: true });
 
+// ---------- landing page (no auth) ----------
+app.get('/', (req, res) => {
+  res.send(\`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Studio API</title><style>
+body{font-family:system-ui,sans-serif;background:#0E2A2B;color:#F3ECDA;max-width:720px;margin:0 auto;padding:32px 20px;line-height:1.6}
+h1{color:#C9A96A;margin-bottom:4px} p.sub{color:#8FB3B0;margin-top:0}
+table{width:100%;border-collapse:collapse;margin:16px 0} th,td{text-align:left;padding:10px;border-bottom:1px solid #1E4344}
+code{background:#1E4344;padding:2px 8px;border-radius:4px;color:#C9A96A}
+a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
+</style></head><body>
+<h1>Studio API</h1>
+<p class="sub">AI content creation service — images, video, scripts. Companion to the <a href="https://ilm-api.vercel.app">Ilm API</a>.</p>
+<p>Status: <span class="ok">Live</span></p>
+<table><tr><th>Method</th><th>Endpoint</th><th>What it does</th></tr>
+<tr><td>POST</td><td><code>/v1/developers/signup</code></td><td>Get an API key</td></tr>
+<tr><td>GET</td><td><code>/v1/health</code></td><td>Service status (needs key)</td></tr>
+<tr><td>POST</td><td><code>/v1/image/generate</code></td><td>AI image from a prompt</td></tr>
+<tr><td>POST</td><td><code>/v1/video/render</code></td><td>Render MP4 (Shorts/YouTube)</td></tr>
+<tr><td>GET</td><td><code>/v1/video/status/:id</code></td><td>Render progress</td></tr>
+<tr><td>GET</td><td><code>/v1/video/file/:id</code></td><td>Download finished MP4</td></tr>
+<tr><td>POST</td><td><code>/v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
+</table>
+<p>Send your key as header <code>x-api-key</code>. Full docs on <a href="https://github.com/zynoraprime2026-dotcom/studio-api">GitHub</a>.</p>
+</body></html>\`);
+});
+
 // ---------- optional Postgres (Supabase) for developer keys ----------
 let pg = null;
 if (process.env.DATABASE_URL) {

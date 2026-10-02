@@ -1,0 +1,16 @@
+{
+  "name": "studio-api",
+  "version": "1.0.0",
+  "description": "AI Studio API — image generation, video rendering, and content creation endpoints. Companion to the Ilm API.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.12.0"
+  }
+}

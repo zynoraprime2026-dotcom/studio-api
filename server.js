@@ -20,7 +20,7 @@ fs.mkdirSync(VIDEOS_DIR, { recursive: true });
 
 // ---------- landing page (no auth) ----------
 app.get('/', (req, res) => {
-  res.send(\`<!DOCTYPE html>
+  res.send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Studio API</title><style>
 body{font-family:system-ui,sans-serif;background:#0E2A2B;color:#F3ECDA;max-width:720px;margin:0 auto;padding:32px 20px;line-height:1.6}
@@ -42,7 +42,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>POST</td><td><code>/v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
 </table>
 <p>Send your key as header <code>x-api-key</code>. Full docs on <a href="https://github.com/zynoraprime2026-dotcom/studio-api">GitHub</a>.</p>
-</body></html>\`);
+</body></html>`);
 });
 
 // ---------- optional Postgres (Supabase) for developer keys ----------

@@ -38,7 +38,8 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Text &rarr; Image</td><td><code>POST /v1/image/generate</code></td><td>AI image from a prompt</td></tr>
 <tr><td>Text &rarr; Content</td><td><code>POST /v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
 <tr><td>Text &rarr; Speech</td><td><code>POST /v1/audio/speak</code></td><td>Natural voice MP3, 300+ voices (en, ar and more), rate control</td></tr>
-<tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, optional narration voice per scene, auto-subtitles (request "subtitles": true)</td></tr>
+<tr><td>Text &rarr; PDF</td><td><code>POST /v1/pdf/generate</code></td><td>Lesson PDFs with vocalized Arabic + grammar sections</td></tr>
+<tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, narration voice per scene, auto-subtitles, webhook callback when done</td></tr>
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
@@ -46,12 +47,14 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><th>Method</th><th>Endpoint</th><th>What it does</th></tr>
 <tr><td>GET</td><td><code>/v1/video/status/:id</code></td><td>Render progress</td></tr>
 <tr><td>GET</td><td><code>/v1/video/file/:id</code></td><td>Download finished MP4</td></tr>
+<tr><td>GET</td><td><code>/v1/video/thumbnail/:id</code></td><td>Branded cover image from a finished video</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">ACCOUNT</h3>
 <table>
 <tr><th>Method</th><th>Endpoint</th><th>What it does</th></tr>
 <tr><td>POST</td><td><code>/v1/developers/signup</code></td><td>Get an API key</td></tr>
 <tr><td>GET</td><td><code>/v1/health</code></td><td>Service status (needs key)</td></tr>
+<tr><td>GET</td><td><code>/v1/usage</code></td><td>Your monthly usage and limit</td></tr>
 </table>
 <p>Send your key as header <code>x-api-key</code>. Full docs on <a href="https://github.com/zynoraprime2026-dotcom/studio-api">GitHub</a>.</p>
 <div style="margin-top:28px;padding-top:20px;border-top:1px solid #1E4344">
@@ -107,6 +110,14 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS api_usage (
+      key TEXT NOT NULL,
+      month TEXT NOT NULL,
+      count INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (key, month)
+    );
+  `);
 }
 
 async function saveDeveloperKey(email, key) {
@@ -124,6 +135,35 @@ async function isValidKey(key) {
   return false;
 }
 
+// ---------- usage metering (free tier) ----------
+const FREE_MONTHLY_LIMIT = parseInt(process.env.FREE_MONTHLY_LIMIT) || 100;
+const memoryUsage = new Map(); // key -> { month, count }
+function currentMonth() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
+
+async function getUsage(key) {
+  const month = currentMonth();
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT count FROM api_usage WHERE key = $1 AND month = $2', [key, month]);
+      return { month, used: r.rowCount ? parseInt(r.rows[0].count) : 0 };
+    } catch (e) { return { month, used: 0 }; }
+  }
+  const u = memoryUsage.get(key);
+  return { month, used: u && u.month === month ? u.count : 0 };
+}
+
+async function incrUsage(key) {
+  const month = currentMonth();
+  if (pool) {
+    try {
+      await pool.query('INSERT INTO api_usage (key, month, count) VALUES ($1, $2, 1) ON CONFLICT (key, month) DO UPDATE SET count = api_usage.count + 1', [key, month]);
+    } catch (e) { console.error('usage incr failed:', e.message); }
+    return;
+  }
+  const u = memoryUsage.get(key);
+  memoryUsage.set(key, u && u.month === month ? { month, count: u.count + 1 } : { month, count: 1 });
+}
+
 // ---------- developer signup (same pattern as Ilm API) ----------
 app.post('/v1/developers/signup', async (req, res) => {
   const email = (req.body && req.body.email || '').trim().toLowerCase();
@@ -137,14 +177,33 @@ app.post('/v1/developers/signup', async (req, res) => {
 });
 
 // ---------- auth middleware ----------
+const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate'];
+
 app.use('/v1', async (req, res, next) => {
   const key = req.headers['x-api-key'];
   try {
-    if (await isValidKey(key)) return next();
+    if (await isValidKey(key)) {
+      req.apiKey = key;
+      if (METERED.includes(req.originalUrl.split('?')[0])) {
+        const { month, used } = await getUsage(key);
+        if (used >= FREE_MONTHLY_LIMIT) {
+          return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', month, limit: FREE_MONTHLY_LIMIT, used });
+        }
+        await incrUsage(key);
+        res.setHeader('X-Usage-Limit', FREE_MONTHLY_LIMIT);
+        res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - 1));
+      }
+      return next();
+    }
   } catch (e) {
     return res.status(500).json({ error: 'Auth check failed: ' + e.message });
   }
   res.status(401).json({ error: 'Missing or invalid API key (x-api-key header)' });
+});
+
+app.get('/v1/usage', async (req, res) => {
+  const { month, used } = await getUsage(req.headers['x-api-key'] || '');
+  res.json({ month, used, limit: FREE_MONTHLY_LIMIT, remaining: Math.max(0, FREE_MONTHLY_LIMIT - used) });
 });
 
 app.get('/v1/health', (req, res) => res.json({ status: 'ok', service: 'studio-api', time: new Date().toISOString() }));
@@ -204,7 +263,8 @@ app.post('/v1/video/render', async (req, res) => {
   const H = isWidescreen ? 720 : 1920;
   const FPS = Math.min(Math.max(parseInt(fps) || 30, 12), 30);
   const jobId = crypto.randomUUID();
-  jobs.set(jobId, { status: 'queued', progress: 0, error: null, videoId: null, createdAt: Date.now() });
+  const hook = (req.body && /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(req.body.webhook || ''))) ? String(req.body.webhook) : null;
+  jobs.set(jobId, { status: 'queued', progress: 0, error: null, videoId: null, createdAt: Date.now(), webhook: hook, baseUrl: 'https://' + req.get('host') });
 
   const hasNarration = scenes.some(sc => sc.narration && String(sc.narration).trim());
   const reqSubtitles = !!(req.body && req.body.subtitles);
@@ -286,6 +346,7 @@ app.post('/v1/video/render', async (req, res) => {
         jobs.get(jobId).status = 'done';
         jobs.get(jobId).progress = 100;
         jobs.get(jobId).videoId = jobId;
+        fireWebhook(jobs.get(jobId));
         return;
       }
       const inputs = [];
@@ -321,9 +382,11 @@ app.post('/v1/video/render', async (req, res) => {
       jobs.get(jobId).status = 'done';
       jobs.get(jobId).progress = 100;
       jobs.get(jobId).videoId = videoId;
+      fireWebhook(jobs.get(jobId));
     } catch (e) {
       jobs.get(jobId).status = 'failed';
       jobs.get(jobId).error = e.message;
+      fireWebhook(jobs.get(jobId));
     }
   })();
 
@@ -343,7 +406,8 @@ app.post('/v1/video/from-image', async (req, res) => {
   const FPS = 30;
   const caption = (b.text && String(b.text).trim()) ? String(b.text).trim() : null;
   const jobId = crypto.randomUUID();
-  jobs.set(jobId, { status: 'queued', progress: 10, error: null, videoId: null, createdAt: Date.now() });
+  const hook = (req.body && /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(req.body.webhook || ''))) ? String(req.body.webhook) : null;
+  jobs.set(jobId, { status: 'queued', progress: 10, error: null, videoId: null, createdAt: Date.now(), webhook: hook, baseUrl: 'https://' + req.get('host') });
   (async () => {
     const jobDir = path.join(VIDEOS_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
@@ -384,9 +448,43 @@ app.post('/v1/video/from-image', async (req, res) => {
     } catch (e) {
       jobs.get(jobId).status = 'failed';
       jobs.get(jobId).error = e.message;
+      fireWebhook(jobs.get(jobId));
     }
   })();
   res.status(202).json({ job_id: jobId, effect, duration, status_url: '/v1/video/status/' + jobId, video_url: '/v1/video/file/' + jobId });
+});
+
+function fireWebhook(job) {
+  if (!job || !job.webhook) return;
+  const payload = { event: job.status === 'done' ? 'render.completed' : 'render.failed', job_id: job.videoId || job.jobId, status: job.status, error: job.error || null, video_url: job.status === 'done' ? job.baseUrl + '/v1/video/file/' + job.videoId : null };
+  fetch(job.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    .catch(e => console.error('webhook delivery failed:', e.message));
+}
+
+// ---------- text -> pdf (lesson sheets with Arabic + grammar) ----------
+app.post('/v1/pdf/generate', async (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim();
+  const sections = Array.isArray(b.sections) ? b.sections : [];
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  if (!sections.length) return res.status(400).json({ error: 'sections array with at least one section is required' });
+  if (sections.length > 40) return res.status(400).json({ error: 'too many sections (max 40)' });
+  const clean = sections.map(s => ({ heading: String((s && s.heading) || '').slice(0, 200), body: String((s && s.body) || '').slice(0, 8000) }));
+  const spec = { title: title.slice(0, 200), subtitle: String(b.subtitle || '').slice(0, 200), footer: String(b.footer || '').slice(0, 200), sections: clean };
+  const specPath = path.join(os.tmpdir(), 'pdf-' + crypto.randomUUID() + '.json');
+  const outPath = path.join(os.tmpdir(), 'pdf-' + crypto.randomUUID() + '.pdf');
+  try {
+    fs.writeFileSync(specPath, JSON.stringify(spec));
+    await execFileAsync('python3', [path.join(__dirname, 'scripts', 'make_pdf.py'), specPath, outPath], { timeout: 120000, maxBuffer: 1024 * 1024 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="lesson.pdf"');
+    const stream = fs.createReadStream(outPath);
+    stream.on('close', () => { try { fs.unlinkSync(specPath); fs.unlinkSync(outPath); } catch (e) {} });
+    stream.pipe(res);
+  } catch (e) {
+    try { fs.unlinkSync(specPath); fs.unlinkSync(outPath); } catch (e2) {}
+    res.status(500).json({ error: 'PDF generation failed: ' + e.message });
+  }
 });
 
 // ---------- text -> speech ----------
@@ -438,6 +536,24 @@ app.get('/v1/video/file/:id', (req, res) => {
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Content-Disposition', `attachment; filename="studio-${req.params.id.slice(0, 8)}.mp4"`);
   fs.createReadStream(p).pipe(res);
+});
+app.get('/v1/video/thumbnail/:id', async (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || job.status !== 'done') return res.status(404).json({ error: 'video not ready or not found' });
+  const p = path.join(VIDEOS_DIR, req.params.id, 'output.mp4');
+  if (!fs.existsSync(p)) return res.status(404).json({ error: 'video file missing' });
+  const at = Math.min(Math.max(parseFloat(req.query.at) || 1, 0), 600);
+  const title = String(req.query.text || '').slice(0, 80);
+  const outPath = path.join(VIDEOS_DIR, req.params.id, 'thumb.jpg');
+  try {
+    const vf = title ? ["drawtext=fontfile=" + FONT + ":text='" + escDrawtext(title) + "':fontcolor=#F3ECDA:fontsize=72:x=(w-text_w)/2:y=h*0.3:box=1:boxcolor=#0E2A2B@0.7:boxborderw=28"] : [];
+    await execFileAsync('ffmpeg', ['-y', '-ss', String(at), '-i', p, '-frames:v', '1', '-vf', (vf.length ? vf.join(',') + ',' : '') + 'scale=1080:-2', '-q:v', '3', outPath], { timeout: 60000 });
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Disposition', 'attachment; filename="thumbnail.jpg"');
+    fs.createReadStream(outPath).pipe(res);
+  } catch (e) {
+    res.status(500).json({ error: 'thumbnail failed: ' + e.message });
+  }
 });
 
 // ---------- content creation ----------

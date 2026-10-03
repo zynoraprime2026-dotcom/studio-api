@@ -140,29 +140,50 @@ const FREE_MONTHLY_LIMIT = parseInt(process.env.FREE_MONTHLY_LIMIT) || 100;
 const memoryUsage = new Map(); // key -> { month, count }
 function currentMonth() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
 
+let lastDbError = null;
+let dbBroken = false; // flips true after a failed query; usage falls back to memory
+
+function memUsage(key, month) {
+  const u = memoryUsage.get(key);
+  return u && u.month === month ? u.count : 0;
+}
+
 async function getUsage(key) {
   const month = currentMonth();
-  if (pool) {
+  if (pool && !dbBroken) {
     try {
       const r = await pool.query('SELECT count FROM api_usage WHERE key = $1 AND month = $2', [key, month]);
-      return { month, used: r.rowCount ? parseInt(r.rows[0].count) : 0 };
-    } catch (e) { return { month, used: 0 }; }
+      return { month, used: r.rowCount ? parseInt(r.rows[0].count) : 0, mode: 'database' };
+    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('usage read failed, falling back to memory:', e.message); }
   }
-  const u = memoryUsage.get(key);
-  return { month, used: u && u.month === month ? u.count : 0 };
+  return { month, used: memUsage(key, month), mode: dbBroken ? 'memory' : 'memory' };
 }
 
 async function incrUsage(key) {
   const month = currentMonth();
-  if (pool) {
+  if (pool && !dbBroken) {
     try {
       await pool.query('INSERT INTO api_usage (key, month, count) VALUES ($1, $2, 1) ON CONFLICT (key, month) DO UPDATE SET count = api_usage.count + 1', [key, month]);
-    } catch (e) { console.error('usage incr failed:', e.message); }
-    return;
+      return;
+    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('usage incr failed, falling back to memory:', e.message); }
   }
   const u = memoryUsage.get(key);
   memoryUsage.set(key, u && u.month === month ? { month, count: u.count + 1 } : { month, count: 1 });
 }
+
+// diagnostic: shows whether the DB connection is healthy
+app.get('/v1/db-check', async (req, res) => {
+  const out = { db_configured: !!pool, last_error: lastDbError ? String(lastDbError).slice(0, 300) : null, live: null };
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT 1 AS ok');
+      out.live = r.rows[0].ok === 1 ? 'connected' : 'unexpected';
+      const t = await pool.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'");
+      out.tables = t.rows.map(x => x.table_name);
+    } catch (e) { out.live = 'failed'; out.last_error = String(e.message).slice(0, 300); }
+  }
+  res.json(out);
+});
 
 // ---------- developer signup (same pattern as Ilm API) ----------
 app.post('/v1/developers/signup', async (req, res) => {

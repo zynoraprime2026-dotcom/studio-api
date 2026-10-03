@@ -38,7 +38,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Text &rarr; Image</td><td><code>POST /v1/image/generate</code></td><td>AI image from a prompt</td></tr>
 <tr><td>Text &rarr; Content</td><td><code>POST /v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
 <tr><td>Text &rarr; Speech</td><td><code>POST /v1/audio/speak</code></td><td>Natural voice MP3, 300+ voices (en, ar and more), rate control</td></tr>
-<tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, optional narration voice per scene</td></tr>
+<tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, optional narration voice per scene, auto-subtitles (request "subtitles": true)</td></tr>
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
@@ -207,6 +207,7 @@ app.post('/v1/video/render', async (req, res) => {
   jobs.set(jobId, { status: 'queued', progress: 0, error: null, videoId: null, createdAt: Date.now() });
 
   const hasNarration = scenes.some(sc => sc.narration && String(sc.narration).trim());
+  const reqSubtitles = !!(req.body && req.body.subtitles);
 
   // async render
   (async () => {
@@ -216,6 +217,26 @@ app.post('/v1/video/render', async (req, res) => {
       // ---- narrated build: one audio-muxed segment per scene, then concat ----
       if (hasNarration) {
         const segFiles = [];
+        const CAP_FONT = fs.existsSync('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf') ? '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' : FONT;
+        const captionFilters = (narrText) => {
+          const size = Math.max(30, Math.round(W / 22));
+          const maxChars = Math.floor((W - 140) / (size * 0.55));
+          const words = String(narrText).trim().split(/\s+/);
+          const lines = [];
+          let cur = '';
+          for (const w of words) {
+            const t = cur ? cur + ' ' + w : w;
+            if (t.length > maxChars && cur) { lines.push(cur); cur = w; } else cur = t;
+          }
+          if (cur) lines.push(cur);
+          const shown = lines.slice(0, 3).map(l => escDrawtext(l));
+          const out = [];
+          shown.forEach((ln, idx) => {
+            const y = 'h*0.88-' + Math.round((shown.length - 1 - idx) * size * 1.4);
+            out.push('drawtext=fontfile=' + CAP_FONT + ':text=\'' + ln + '\':fontcolor=white:fontsize=' + size + ':x=(w-text_w)/2:y=' + y + ':box=1:boxcolor=black@0.55:boxborderw=14');
+          });
+          return out;
+        };
         for (let i = 0; i < scenes.length; i++) {
           const sc = scenes[i];
           if (!sc.image && !sc.text) throw new Error('scene ' + (i + 1) + ': needs image or text');
@@ -240,6 +261,9 @@ app.post('/v1/video/render', async (req, res) => {
           if (sc.text && String(sc.text).trim()) {
             const size = Math.max(28, Math.round(W / 18));
             parts.push('drawtext=fontfile=' + FONT + ":text='" + escDrawtext(sc.text) + "':fontcolor=#F3ECDA:fontsize=" + size + ':line_spacing=' + Math.round(size * 0.5) + ':x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=#0E2A2B@0.65:boxborderw=24');
+          }
+          if (narrPath && (sc.subtitles !== undefined ? !!sc.subtitles : reqSubtitles)) {
+            parts.push(...captionFilters(sc.narration));
           }
           parts.push("zoompan=z='min(1+0.0006*in,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=" + W + 'x' + H + ':fps=' + FPS, 'format=yuv420p');
           const seg = path.join(jobDir, 'seg' + i + '.mp4');

@@ -37,7 +37,8 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><th>Flow</th><th>Endpoint</th><th>What it does</th></tr>
 <tr><td>Text &rarr; Image</td><td><code>POST /v1/image/generate</code></td><td>AI image from a prompt</td></tr>
 <tr><td>Text &rarr; Content</td><td><code>POST /v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
-<tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen</td></tr>
+<tr><td>Text &rarr; Speech</td><td><code>POST /v1/audio/speak</code></td><td>Natural voice MP3, 300+ voices (en, ar and more), rate control</td></tr>
+<tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, optional narration voice per scene</td></tr>
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
@@ -205,11 +206,64 @@ app.post('/v1/video/render', async (req, res) => {
   const jobId = crypto.randomUUID();
   jobs.set(jobId, { status: 'queued', progress: 0, error: null, videoId: null, createdAt: Date.now() });
 
+  const hasNarration = scenes.some(sc => sc.narration && String(sc.narration).trim());
+
   // async render
   (async () => {
     const jobDir = path.join(VIDEOS_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
     try {
+      // ---- narrated build: one audio-muxed segment per scene, then concat ----
+      if (hasNarration) {
+        const segFiles = [];
+        for (let i = 0; i < scenes.length; i++) {
+          const sc = scenes[i];
+          if (!sc.image && !sc.text) throw new Error('scene ' + (i + 1) + ': needs image or text');
+          let dur = Math.max(1, Math.min(parseFloat(sc.duration) || 4, 30));
+          let narrPath = null;
+          if (sc.narration && String(sc.narration).trim()) {
+            narrPath = path.join(jobDir, 'narr' + i + '.mp3');
+            await speakText(sc.narration, sc.voice, sc.rate, narrPath);
+            const ad = await mediaDuration(narrPath);
+            dur = Math.max(dur, Math.min(ad + 0.8, 60));
+          }
+          const parts = [];
+          const vf = ['scale=' + W * 1.5 + ':' + H * 1.5 + ':force_original_aspect_ratio=increase', 'crop=' + W * 1.5 + ':' + H * 1.5];
+          let baseInput;
+          if (sc.image) {
+            const imgPath = path.join(jobDir, 'scene' + i + '.img');
+            await downloadImage(sc.image, imgPath);
+            baseInput = ['-loop', '1', '-framerate', String(FPS), '-t', String(dur), '-i', imgPath];
+          } else {
+            baseInput = ['-f', 'lavfi', '-t', String(dur), '-i', 'color=c=0x0E2A2B:s=' + W + 'x' + H + ':r=' + FPS];
+          }
+          if (sc.text && String(sc.text).trim()) {
+            const size = Math.max(28, Math.round(W / 18));
+            parts.push('drawtext=fontfile=' + FONT + ":text='" + escDrawtext(sc.text) + "':fontcolor=#F3ECDA:fontsize=" + size + ':line_spacing=' + Math.round(size * 0.5) + ':x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=#0E2A2B@0.65:boxborderw=24');
+          }
+          parts.push("zoompan=z='min(1+0.0006*in,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=" + W + 'x' + H + ':fps=' + FPS, 'format=yuv420p');
+          const seg = path.join(jobDir, 'seg' + i + '.mp4');
+          const args = ['-y', ...baseInput];
+          const vfFull = (sc.image ? vf.join(',') + ',' : '') + parts.join(',');
+          if (narrPath) {
+            args.push('-i', narrPath, '-vf', vfFull, '-t', String(dur), '-af', 'apad', '-c:v', 'libx264', '-preset', 'fast', '-c:a', 'aac', '-b:a', '128k', '-shortest', seg);
+          } else {
+            args.push('-vf', vfFull, '-t', String(dur), '-c:v', 'libx264', '-preset', 'fast', seg);
+          }
+          await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+          segFiles.push(seg);
+          jobs.get(jobId).progress = Math.round(((i + 1) / scenes.length) * 85);
+        }
+        const listPath = path.join(jobDir, 'list.txt');
+        fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\''") + "'").join('\n'));
+        const outPath = path.join(jobDir, 'output.mp4');
+        const hasAudio = segFiles.length > 0 && scenes.some(sc => sc.narration && String(sc.narration).trim());
+        await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', outPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+        jobs.get(jobId).status = 'done';
+        jobs.get(jobId).progress = 100;
+        jobs.get(jobId).videoId = jobId;
+        return;
+      }
       const inputs = [];
       const filters = [];
       const concatLabels = [];
@@ -309,6 +363,41 @@ app.post('/v1/video/from-image', async (req, res) => {
     }
   })();
   res.status(202).json({ job_id: jobId, effect, duration, status_url: '/v1/video/status/' + jobId, video_url: '/v1/video/file/' + jobId });
+});
+
+// ---------- text -> speech ----------
+const VOICE_RE = /^[a-z]{2,4}-[A-Z]{2}-[A-Za-z]+$/;
+const DEFAULT_VOICE = 'en-US-GuyNeural';
+
+async function speakText(text, voice, rate, outPath) {
+  const v = VOICE_RE.test(String(voice || '')) ? String(voice) : DEFAULT_VOICE;
+  const r = /^-?\d+%$/.test(String(rate || '')) ? String(rate) : '+0%';
+  await execFileAsync('edge-tts', ['--voice', v, '--rate=' + r, '--text', String(text).slice(0, 2000), '--write-media', outPath], { timeout: 120000, maxBuffer: 1024 * 1024 });
+}
+
+async function mediaDuration(p) {
+  const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', p], { timeout: 60000 });
+  return parseFloat(stdout.trim()) || 0;
+}
+
+app.post('/v1/audio/speak', async (req, res) => {
+  const b = req.body || {};
+  const text = String(b.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  if (text.length > 2000) return res.status(400).json({ error: 'text too long (max 2000 chars)' });
+  const voice = VOICE_RE.test(String(b.voice || '')) ? String(b.voice) : DEFAULT_VOICE;
+  const tmp = path.join(os.tmpdir(), 'speak-' + crypto.randomUUID() + '.mp3');
+  try {
+    await speakText(text, b.voice, b.rate, tmp);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'attachment; filename="speech.mp3"');
+    const stream = fs.createReadStream(tmp);
+    stream.on('close', () => { try { fs.unlinkSync(tmp); } catch (e) {} });
+    stream.pipe(res);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+    res.status(500).json({ error: 'speech generation failed: ' + e.message });
+  }
 });
 
 app.get('/v1/video/status/:id', (req, res) => {

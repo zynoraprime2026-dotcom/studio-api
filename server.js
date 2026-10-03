@@ -180,7 +180,11 @@ app.get('/v1/db-check', async (req, res) => {
       out.live = r.rows[0].ok === 1 ? 'connected' : 'unexpected';
       const t = await pool.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'");
       out.tables = t.rows.map(x => x.table_name);
-    } catch (e) { out.live = 'failed'; out.last_error = String(e.message).slice(0, 300); }
+    } catch (e) {
+      out.live = 'failed';
+      out.last_error = String(e.message).slice(0, 300);
+      out.error_dump = JSON.stringify({ name: e.name, code: e.code, errno: e.errno, syscall: e.syscall, hostname: e.hostname, detail: e.detail, hint: e.hint, stack: String(e.stack || '').split('\n').slice(0, 3) }).slice(0, 900);
+    }
   }
   res.json(out);
 });

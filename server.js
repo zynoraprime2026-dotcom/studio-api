@@ -32,14 +32,25 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <h1>Studio API</h1>
 <p class="sub">AI content creation service — images, video, scripts. Companion to the <a href="https://ilm-api.vercel.app">Ilm API</a>.</p>
 <p>Status: <span class="ok">Live</span></p>
-<table><tr><th>Method</th><th>Endpoint</th><th>What it does</th></tr>
-<tr><td>POST</td><td><code>/v1/developers/signup</code></td><td>Get an API key</td></tr>
-<tr><td>GET</td><td><code>/v1/health</code></td><td>Service status (needs key)</td></tr>
-<tr><td>POST</td><td><code>/v1/image/generate</code></td><td>AI image from a prompt</td></tr>
-<tr><td>POST</td><td><code>/v1/video/render</code></td><td>Render MP4 (Shorts/YouTube)</td></tr>
+<h3 style="color:#C9A96A;margin:22px 0 6px">CREATE</h3>
+<table>
+<tr><th>Flow</th><th>Endpoint</th><th>What it does</th></tr>
+<tr><td>Text &rarr; Image</td><td><code>POST /v1/image/generate</code></td><td>AI image from a prompt</td></tr>
+<tr><td>Text &rarr; Content</td><td><code>POST /v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
+<tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen</td></tr>
+<tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
+</table>
+<h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
+<table>
+<tr><th>Method</th><th>Endpoint</th><th>What it does</th></tr>
 <tr><td>GET</td><td><code>/v1/video/status/:id</code></td><td>Render progress</td></tr>
 <tr><td>GET</td><td><code>/v1/video/file/:id</code></td><td>Download finished MP4</td></tr>
-<tr><td>POST</td><td><code>/v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
+</table>
+<h3 style="color:#C9A96A;margin:22px 0 6px">ACCOUNT</h3>
+<table>
+<tr><th>Method</th><th>Endpoint</th><th>What it does</th></tr>
+<tr><td>POST</td><td><code>/v1/developers/signup</code></td><td>Get an API key</td></tr>
+<tr><td>GET</td><td><code>/v1/health</code></td><td>Service status (needs key)</td></tr>
 </table>
 <p>Send your key as header <code>x-api-key</code>. Full docs on <a href="https://github.com/zynoraprime2026-dotcom/studio-api">GitHub</a>.</p>
 <div style="margin-top:28px;padding-top:20px;border-top:1px solid #1E4344">
@@ -239,6 +250,65 @@ app.post('/v1/video/render', async (req, res) => {
   })();
 
   res.status(202).json({ job_id: jobId, status_url: `/v1/video/status/${jobId}`, video_url: `/v1/video/file/${jobId}` });
+});
+
+// ---------- image -> video (Ken Burns) ----------
+const KB_EFFECTS = ['zoom_in', 'zoom_out', 'pan_left', 'pan_right', 'static'];
+app.post('/v1/video/from-image', async (req, res) => {
+  const b = req.body || {};
+  const imageUrl = b.image_url || b.image;
+  if (!imageUrl || !/^https:\/\//.test(String(imageUrl))) return res.status(400).json({ error: 'https image_url is required' });
+  const duration = Math.min(Math.max(parseFloat(b.duration) || 8, 2), 30);
+  const effect = KB_EFFECTS.includes(b.effect) ? b.effect : 'zoom_in';
+  const isWide = b.aspect === 'wide' || b.aspect === 'landscape';
+  const W = isWide ? 1280 : 1080, H = isWide ? 720 : 1920;
+  const FPS = 30;
+  const caption = (b.text && String(b.text).trim()) ? String(b.text).trim() : null;
+  const jobId = crypto.randomUUID();
+  jobs.set(jobId, { status: 'queued', progress: 10, error: null, videoId: null, createdAt: Date.now() });
+  (async () => {
+    const jobDir = path.join(VIDEOS_DIR, jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    try {
+      const imgPath = path.join(jobDir, 'source.img');
+      await downloadImage(imageUrl, imgPath);
+      jobs.get(jobId).progress = 40;
+      const N = Math.round(duration * FPS);
+      let z, x, y;
+      switch (effect) {
+        case 'zoom_out': z = 'max(1.25-' + (0.25 / N).toFixed(6) + '*in,1.0)'; x = 'iw/2-(iw/zoom/2)'; y = 'ih/2-(ih/zoom/2)'; break;
+        case 'pan_left': z = '1.25'; x = '(iw-iw/zoom)*max(1-in/' + N + ',0)'; y = 'ih/2-(ih/zoom/2)'; break;
+        case 'pan_right': z = '1.25'; x = '(iw-iw/zoom)*min(in/' + N + ',1)'; y = 'ih/2-(ih/zoom/2)'; break;
+        case 'static': z = '1'; x = '0'; y = '0'; break;
+        default: z = 'min(1+' + (0.25 / N).toFixed(6) + '*in,1.25)'; x = 'iw/2-(iw/zoom/2)'; y = 'ih/2-(ih/zoom/2)';
+      }
+      const parts = [
+        'scale=' + Math.round(W * 1.5) + ':' + Math.round(H * 1.5) + ':force_original_aspect_ratio=increase',
+        'crop=' + Math.round(W * 1.5) + ':' + Math.round(H * 1.5)
+      ];
+      if (effect === 'static') {
+        parts.push('scale=' + W + ':' + H);
+      } else {
+        parts.push("zoompan=z='" + z + "':x='" + x + "':y='" + y + "':d=1:s=" + W + 'x' + H + ':fps=' + FPS);
+      }
+      if (caption) {
+        const size = Math.max(28, Math.round(W / 18));
+        parts.push('drawtext=fontfile=' + FONT + ":text='" + escDrawtext(caption) + "':fontcolor=#F3ECDA:fontsize=" + size + ':line_spacing=' + Math.round(size * 0.5) + ':x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=#0E2A2B@0.65:boxborderw=24');
+      }
+      parts.push('format=yuv420p');
+      const args = ['-y', '-loop', '1', '-framerate', String(FPS), '-t', String(duration), '-i', imgPath,
+        '-vf', parts.join(','), '-r', String(FPS), '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
+        path.join(jobDir, 'output.mp4')];
+      await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+      jobs.get(jobId).status = 'done';
+      jobs.get(jobId).progress = 100;
+      jobs.get(jobId).videoId = jobId;
+    } catch (e) {
+      jobs.get(jobId).status = 'failed';
+      jobs.get(jobId).error = e.message;
+    }
+  })();
+  res.status(202).json({ job_id: jobId, effect, duration, status_url: '/v1/video/status/' + jobId, video_url: '/v1/video/file/' + jobId });
 });
 
 app.get('/v1/video/status/:id', (req, res) => {

@@ -42,6 +42,33 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>POST</td><td><code>/v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
 </table>
 <p>Send your key as header <code>x-api-key</code>. Full docs on <a href="https://github.com/zynoraprime2026-dotcom/studio-api">GitHub</a>.</p>
+<div style="margin-top:28px;padding-top:20px;border-top:1px solid #1E4344">
+<h3 style="color:#C9A96A;margin-bottom:6px">Get your API key</h3>
+<p style="font-size:.85rem;color:#8FB3B0;margin-bottom:10px">Enter your email — a key is created instantly.</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<input id="email" type="email" placeholder="you@example.com" style="flex:1;min-width:180px;padding:11px;border-radius:10px;border:1px solid #2A5556;background:#0E2A2B;color:#F3ECDA;font-size:.95rem">
+<button onclick="signup()" style="padding:11px 18px;border:none;border-radius:10px;background:#C9A96A;color:#0E2A2B;font-weight:700;font-size:.95rem;cursor:pointer">Sign up</button>
+</div>
+<div id="keybox" style="display:none;margin-top:14px;background:#1E4344;border-radius:10px;padding:14px">
+<div style="font-size:.8rem;color:#8FB3B0;margin-bottom:6px">Your API key (copy it now, keep it safe):</div>
+<div id="keyout" style="font-family:monospace;color:#C9A96A;word-break:break-all"></div>
+</div>
+<div id="err" style="display:none;margin-top:10px;color:#E57373;font-size:.85rem"></div>
+</div>
+<script>
+async function signup(){
+  var em = document.getElementById('email').value.trim();
+  if(!em){ return; }
+  document.getElementById('err').style.display='none';
+  try {
+    var r = await fetch('/v1/developers/signup', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em})});
+    var d = await r.json();
+    if(d.key){ document.getElementById('keybox').style.display='block'; document.getElementById('keyout').textContent = d.key; }
+    else { document.getElementById('err').textContent = d.error || 'Signup failed'; document.getElementById('err').style.display='block'; }
+  } catch(e){ document.getElementById('err').textContent='Could not reach the server'; document.getElementById('err').style.display='block'; }
+}
+</script>
+</body></html>
 </body></html>`);
 });
 

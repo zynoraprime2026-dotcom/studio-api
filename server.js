@@ -515,10 +515,21 @@ app.post('/v1/image/generate', async (req, res) => {
 const jobs = new Map(); // id -> { status, progress, error, videoId }
 
 async function downloadImage(url, dest) {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error('image download failed: ' + resp.status);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(dest, buf);
+  // The image provider occasionally 500s under load; retry with backoff.
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 StudioAPI/1.0' } });
+      if (!resp.ok) throw new Error('image download failed: ' + resp.status);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      fs.writeFileSync(dest, buf);
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 2) await new Promise(r => setTimeout(r, (attempt + 1) * 4000));
+    }
+  }
+  throw lastErr;
 }
 
 const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf';

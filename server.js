@@ -44,6 +44,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
 <tr><td>Multi-step Workflows</td><td><code>POST /v1/workflows</code></td><td>Chain steps (image &rarr; speech &rarr; animate); later steps reuse earlier outputs via <code>{{s1.url}}</code></td></tr>
 <tr><td>Portfolio Service</td><td><code>/v1/portfolios</code></td><td>Artist portfolios with AI-generated or uploaded artworks; publish to a shareable gallery</td></tr>
+<tr><td>Game Logic Service</td><td><code>/v1/games</code></td><td>Branching narrative projects: scenes, player choices, AI scene art, story maps</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
 <table>
@@ -54,6 +55,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>GET</td><td><code>/v1/workflows/:id</code></td><td>Workflow progress &amp; step outputs</td></tr>
 <tr><td>GET</td><td><code>/v1/workflows/:id/files/:name</code></td><td>Download step output files</td></tr>
 <tr><td>GET</td><td><code>/gallery/:id</code></td><td>Public portfolio gallery (no key needed, published portfolios)</td></tr>
+<tr><td>GET</td><td><code>/v1/games/:id/story-map</code></td><td>Branching map with unresolved targets &amp; unreachable scenes</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">ACCOUNT</h3>
 <table>
@@ -225,6 +227,32 @@ async function initDb() {
       image_url TEXT NOT NULL,
       prompt TEXT,
       created_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_projects (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      genre TEXT,
+      description TEXT,
+      start_scene TEXT,
+      created_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_scenes (
+      id TEXT PRIMARY KEY,
+      game_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      narrative TEXT NOT NULL,
+      choices JSONB DEFAULT '[]',
+      image_url TEXT,
+      prompt TEXT,
+      created_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ
     );
   `);
   await pool.query(`
@@ -409,7 +437,7 @@ app.delete('/v1/presets/:ref', async (req, res) => {
 app.get('/v1/openapi.json', (req, res) => {
   res.json({
     openapi: '3.0.3',
-    info: { title: 'Studio API', version: '1.5.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
+    info: { title: 'Studio API', version: '1.6.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
     servers: [{ url: 'https://studio-api-nqpm.onrender.com' }],
     components: {
       securitySchemes: { ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' } },
@@ -438,6 +466,12 @@ app.get('/v1/openapi.json', (req, res) => {
       '/v1/portfolios/{id}': { get: { summary: 'Portfolio with artworks', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, patch: { summary: 'Update portfolio (publish with {"published": true})', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete portfolio and its artworks', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
       '/v1/portfolios/{id}/artworks': { post: { summary: 'Add artwork — supply image_url, or generate with {generate: {prompt, preset, width, height, seed}}', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '201': { description: 'created' } } } },
       '/v1/portfolios/{id}/artworks/{aid}': { delete: { summary: 'Remove an artwork', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'aid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
+      '/v1/games': { post: { summary: 'Create a game project', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['title'], properties: { title: { type: 'string' }, genre: { type: 'string' }, description: { type: 'string' } } } } } }, responses: { '201': { description: 'created' } } }, get: { summary: 'List your games', responses: { '200': { description: 'ok' } } } },
+      '/v1/games/{id}': { get: { summary: 'Game with all scenes', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, patch: { summary: 'Update game (set start_scene)', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete game and scenes', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
+      '/v1/games/{id}/scenes': { post: { summary: 'Add a narrative segment: title, narrative, choices [{label, target, outcome}]', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '201': { description: 'created' } } }, get: { summary: 'List scenes', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
+      '/v1/games/{id}/scenes/{sid}': { patch: { summary: 'Update scene narrative/choices', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete scene', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
+      '/v1/games/{id}/scenes/{sid}/assets': { post: { summary: 'Generate scene art (prompt defaults from the scene narrative; metered)', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'art generated' } } } },
+      '/v1/games/{id}/story-map': { get: { summary: 'Branch graph: nodes, edges, unresolved targets, unreachable scenes', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
       '/v1/workflows/{id}': { get: { summary: 'Workflow status with per-step results', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
       '/v1/workflows/{id}/files/{name}': { get: { summary: 'Download a step output file', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'name', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'file bytes' } } } },
     },
@@ -458,7 +492,7 @@ app.post('/v1/developers/signup', async (req, res) => {
 });
 
 // ---------- auth middleware ----------
-const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios'];
+const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios', '/v1/games'];
 
 app.use('/v1', async (req, res, next) => {
   const key = req.headers['x-api-key'];
@@ -1312,6 +1346,261 @@ ${p.description ? `<p class="desc">${p.description}</p>` : ''}
 <div class="grid">${cards}</div>
 <p class="foot">Powered by <a href="/">Studio API</a> — Al-Haqq Digital</p>
 </div></body></html>`);
+});
+
+// ---------- game logic service (Phase C) ----------
+// Serves the Game Prototype Builder: branching narrative projects with
+// scenes, player choices, and AI-generated scene art. Same resilient
+// storage pattern as portfolios (database + in-memory mirror).
+const memGames = new Map();  // id -> game row
+const memScenes = new Map(); // id -> scene row
+
+function gmCleanChoices(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const c of raw.slice(0, 6)) {
+    if (!c || typeof c !== 'object') continue;
+    const label = String(c.label || '').trim().slice(0, 120);
+    if (!label) continue;
+    out.push({ label, target: c.target ? String(c.target).slice(0, 80) : null, outcome: String(c.outcome || '').slice(0, 300) });
+  }
+  return out;
+}
+
+async function gmSave(g) {
+  memGames.set(g.id, g);
+  if (!pool || dbBroken) return;
+  try {
+    await pool.query(
+      'INSERT INTO game_projects (id, key, title, genre, description, start_scene, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET title=$3, genre=$4, description=$5, start_scene=$6, updated_at=$8',
+      [g.id, g.key, g.title, g.genre || null, g.description || null, g.start_scene || null, g.created_at, g.updated_at]
+    );
+  } catch (e) { console.error('game persist failed:', e.message); }
+}
+
+async function gmList(key) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM game_projects WHERE key = $1 ORDER BY created_at DESC', [key]);
+      if (r.rowCount) return r.rows;
+    } catch (e) { console.error('game list failed:', e.message); }
+  }
+  return [...memGames.values()].filter(g => g.key === key).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+}
+
+async function gmGet(id) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM game_projects WHERE id = $1', [id]);
+      if (r.rowCount) return r.rows[0];
+    } catch (e) { console.error('game get failed:', e.message); }
+  }
+  return memGames.get(id) || null;
+}
+
+async function gmDelete(id) {
+  memGames.delete(id);
+  for (const [sid, s] of [...memScenes]) if (s.game_id === id) memScenes.delete(sid);
+  if (pool && !dbBroken) {
+    try { await pool.query('DELETE FROM game_scenes WHERE game_id = $1', [id]); await pool.query('DELETE FROM game_projects WHERE id = $1', [id]); }
+    catch (e) { console.error('game delete failed:', e.message); }
+  }
+}
+
+async function scSave(s) {
+  memScenes.set(s.id, s);
+  if (!pool || dbBroken) return;
+  try {
+    await pool.query(
+      'INSERT INTO game_scenes (id, game_id, key, title, narrative, choices, image_url, prompt, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO UPDATE SET title=$4, narrative=$5, choices=$6, image_url=$7, prompt=$8, updated_at=$10',
+      [s.id, s.game_id, s.key, s.title, s.narrative, JSON.stringify(s.choices || []), s.image_url || null, s.prompt || null, s.created_at, s.updated_at]
+    );
+  } catch (e) { console.error('scene persist failed:', e.message); }
+}
+
+async function scList(gameId) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM game_scenes WHERE game_id = $1 ORDER BY created_at', [gameId]);
+      if (r.rowCount) return r.rows.map(row => ({ ...row, choices: row.choices || [] }));
+    } catch (e) { console.error('scene list failed:', e.message); }
+  }
+  return [...memScenes.values()].filter(s => s.game_id === gameId).sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+}
+
+async function scGet(id) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM game_scenes WHERE id = $1', [id]);
+      if (r.rowCount) return { ...r.rows[0], choices: r.rows[0].choices || [] };
+    } catch (e) { console.error('scene get failed:', e.message); }
+  }
+  const s = memScenes.get(id);
+  return s ? { ...s, choices: s.choices || [] } : null;
+}
+
+async function scDelete(id) {
+  memScenes.delete(id);
+  if (pool && !dbBroken) {
+    try { await pool.query('DELETE FROM game_scenes WHERE id = $1', [id]); }
+    catch (e) { console.error('scene delete failed:', e.message); }
+  }
+}
+
+app.post('/v1/games', async (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 120);
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  const now = new Date().toISOString();
+  const g = {
+    id: crypto.randomUUID(), key: req.apiKey, title,
+    genre: String(b.genre || '').slice(0, 60) || null,
+    description: String(b.description || '').slice(0, 2000),
+    start_scene: null, created_at: now, updated_at: now,
+  };
+  await gmSave(g);
+  res.status(201).json({ ...g, scenes_url: '/v1/games/' + g.id + '/scenes', story_map_url: '/v1/games/' + g.id + '/story-map' });
+});
+
+app.get('/v1/games', async (req, res) => {
+  res.json({ games: await gmList(req.apiKey) });
+});
+
+app.get('/v1/games/:id', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  res.json({ ...g, scenes: await scList(g.id) });
+});
+
+app.patch('/v1/games/:id', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  const b = req.body || {};
+  if (b.title !== undefined) g.title = String(b.title).trim().slice(0, 120) || g.title;
+  if (b.genre !== undefined) g.genre = String(b.genre).slice(0, 60) || null;
+  if (b.description !== undefined) g.description = String(b.description).slice(0, 2000);
+  if (b.start_scene !== undefined) {
+    if (b.start_scene === null) g.start_scene = null;
+    else {
+      const s = await scGet(String(b.start_scene));
+      if (!s || s.game_id !== g.id) return res.status(400).json({ error: 'start_scene must be a scene id in this game' });
+      g.start_scene = s.id;
+    }
+  }
+  g.updated_at = new Date().toISOString();
+  await gmSave(g);
+  res.json(g);
+});
+
+app.delete('/v1/games/:id', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  await gmDelete(g.id);
+  res.json({ deleted: true, id: g.id });
+});
+
+app.post('/v1/games/:id/scenes', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 160);
+  const narrative = String(b.narrative || '').trim().slice(0, 4000);
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  if (!narrative) return res.status(400).json({ error: 'narrative is required' });
+  const now = new Date().toISOString();
+  const s = {
+    id: crypto.randomUUID(), game_id: g.id, key: req.apiKey, title, narrative,
+    choices: gmCleanChoices(b.choices), image_url: null, prompt: null,
+    created_at: now, updated_at: now,
+  };
+  await scSave(s);
+  if (!g.start_scene) { g.start_scene = s.id; g.updated_at = now; await gmSave(g); }
+  res.status(201).json({ ...s, note: g.start_scene === s.id ? 'this is the start scene' : undefined });
+});
+
+app.get('/v1/games/:id/scenes', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  res.json({ scenes: await scList(g.id) });
+});
+
+app.patch('/v1/games/:id/scenes/:sid', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  const s = await scGet(req.params.sid);
+  if (!s || s.game_id !== g.id) return res.status(404).json({ error: 'scene not found' });
+  const b = req.body || {};
+  if (b.title !== undefined) s.title = String(b.title).trim().slice(0, 160) || s.title;
+  if (b.narrative !== undefined) s.narrative = String(b.narrative).trim().slice(0, 4000) || s.narrative;
+  if (b.choices !== undefined) s.choices = gmCleanChoices(b.choices);
+  s.updated_at = new Date().toISOString();
+  await scSave(s);
+  res.json(s);
+});
+
+app.delete('/v1/games/:id/scenes/:sid', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  const s = await scGet(req.params.sid);
+  if (!s || s.game_id !== g.id) return res.status(404).json({ error: 'scene not found' });
+  await scDelete(s.id);
+  if (g.start_scene === s.id) {
+    const remaining = await scList(g.id);
+    g.start_scene = remaining.length ? remaining[0].id : null;
+    g.updated_at = new Date().toISOString();
+    await gmSave(g);
+  }
+  res.json({ deleted: true, id: s.id, start_scene_now: g.start_scene });
+});
+
+// generate a visual asset for a scene; the scene narrative feeds the prompt
+app.post('/v1/games/:id/scenes/:sid/assets', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  const s = await scGet(req.params.sid);
+  if (!s || s.game_id !== g.id) return res.status(404).json({ error: 'scene not found' });
+  const b = req.body || {};
+  const { used } = await getUsage(req.apiKey);
+  if (used >= FREE_MONTHLY_LIMIT) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT, used });
+  const prompt = String(b.prompt || s.title + (s.narrative ? ' — ' + s.narrative.slice(0, 200) : ''));
+  try {
+    const out = await wfImage({ prompt, preset: b.preset || null, width: b.width, height: b.height, model: b.model || null, seed: b.seed || null });
+    s.image_url = out.url;
+    s.prompt = out.prompt;
+    s.updated_at = new Date().toISOString();
+    await scSave(s);
+    await incrUsage(req.apiKey);
+    res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - 1));
+    res.json({ scene_id: s.id, title: s.title, image_url: s.image_url, prompt: s.prompt, width: out.width, height: out.height });
+  } catch (e) { return res.status(400).json({ error: e.message }); }
+});
+
+// branching map: nodes, edges, unresolved choice targets, unreachable scenes
+app.get('/v1/games/:id/story-map', async (req, res) => {
+  const g = await gmGet(req.params.id);
+  if (!g || g.key !== req.apiKey) return res.status(404).json({ error: 'game not found' });
+  const scenes = await scList(g.id);
+  const byId = new Map(scenes.map(s => [s.id, s]));
+  const nodes = scenes.map(s => ({ id: s.id, title: s.title, start: s.id === g.start_scene, has_art: !!s.image_url }));
+  const edges = [];
+  const unresolved = [];
+  for (const s of scenes) {
+    for (const c of s.choices || []) {
+      if (!c.target) { edges.push({ from: s.id, label: c.label, to: null }); continue; }
+      if (!byId.has(c.target)) { unresolved.push({ scene: s.id, choice: c.label, target: c.target }); continue; }
+      edges.push({ from: s.id, label: c.label, to: c.target });
+    }
+  }
+  // reachability from the start scene
+  const reachable = new Set();
+  const walk = (id) => {
+    if (reachable.has(id) || !byId.has(id)) return;
+    reachable.add(id);
+    for (const c of (byId.get(id).choices || [])) if (c.target) walk(c.target);
+  };
+  if (g.start_scene) walk(g.start_scene);
+  const unreachable = scenes.filter(s => !reachable.has(s.id)).map(s => ({ id: s.id, title: s.title }));
+  res.json({ game_id: g.id, start_scene: g.start_scene, nodes, edges, unresolved_targets: unresolved, unreachable_scenes: unreachable });
 });
 
 // ---------- start ----------

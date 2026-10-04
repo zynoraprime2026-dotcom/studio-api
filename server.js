@@ -43,6 +43,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, narration voice per scene, auto-subtitles, webhook callback when done</td></tr>
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
 <tr><td>Multi-step Workflows</td><td><code>POST /v1/workflows</code></td><td>Chain steps (image &rarr; speech &rarr; animate); later steps reuse earlier outputs via <code>{{s1.url}}</code></td></tr>
+<tr><td>Portfolio Service</td><td><code>/v1/portfolios</code></td><td>Artist portfolios with AI-generated or uploaded artworks; publish to a shareable gallery</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
 <table>
@@ -52,6 +53,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>GET</td><td><code>/v1/video/thumbnail/:id</code></td><td>Branded cover image from a finished video</td></tr>
 <tr><td>GET</td><td><code>/v1/workflows/:id</code></td><td>Workflow progress &amp; step outputs</td></tr>
 <tr><td>GET</td><td><code>/v1/workflows/:id/files/:name</code></td><td>Download step output files</td></tr>
+<tr><td>GET</td><td><code>/gallery/:id</code></td><td>Public portfolio gallery (no key needed, published portfolios)</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">ACCOUNT</h3>
 <table>
@@ -199,6 +201,30 @@ async function initDb() {
       month TEXT NOT NULL,
       count INT NOT NULL DEFAULT 0,
       PRIMARY KEY (key, month)
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS portfolios (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      artist TEXT,
+      published BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS artworks (
+      id TEXT PRIMARY KEY,
+      portfolio_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      image_url TEXT NOT NULL,
+      prompt TEXT,
+      created_at TIMESTAMPTZ
     );
   `);
   await pool.query(`
@@ -383,7 +409,7 @@ app.delete('/v1/presets/:ref', async (req, res) => {
 app.get('/v1/openapi.json', (req, res) => {
   res.json({
     openapi: '3.0.3',
-    info: { title: 'Studio API', version: '1.4.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
+    info: { title: 'Studio API', version: '1.5.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
     servers: [{ url: 'https://studio-api-nqpm.onrender.com' }],
     components: {
       securitySchemes: { ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' } },
@@ -408,6 +434,10 @@ app.get('/v1/openapi.json', (req, res) => {
       '/v1/content/generate': { post: { summary: 'Generate shorts scripts, lessons, or social posts', responses: { '200': { description: 'ok' } } } },
       '/v1/workflows': { post: { summary: 'Run a multi-step generation workflow (image, speech, animate, content steps; outputs chain forward via {{stepId.field}})', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['steps'], properties: { name: { type: 'string' }, webhook: { type: 'string', description: 'https URL called on completion or failure' }, steps: { type: 'array', maxItems: 20, items: { type: 'object', required: ['action'], properties: { id: { type: 'string', description: 'reference id, default s1, s2... used in {{id.field}} templates' }, action: { type: 'string', enum: ['image', 'speech', 'animate', 'content'] }, params: { type: 'object', description: 'action-specific params; strings may embed {{stepId.field}} references to earlier outputs' } } } } } } } } }, responses: { '202': { description: 'workflow queued; poll /v1/workflows/{id}' } } } },
       '/v1/workflows/list': { get: { summary: 'List your recent workflows', responses: { '200': { description: 'ok' } } } },
+      '/v1/portfolios': { post: { summary: 'Create an artist portfolio', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['title'], properties: { title: { type: 'string' }, description: { type: 'string' }, artist: { type: 'string' }, published: { type: 'boolean' } } } } } }, responses: { '201': { description: 'created' } } }, get: { summary: 'List your portfolios', responses: { '200': { description: 'ok' } } } },
+      '/v1/portfolios/{id}': { get: { summary: 'Portfolio with artworks', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, patch: { summary: 'Update portfolio (publish with {"published": true})', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete portfolio and its artworks', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
+      '/v1/portfolios/{id}/artworks': { post: { summary: 'Add artwork — supply image_url, or generate with {generate: {prompt, preset, width, height, seed}}', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '201': { description: 'created' } } } },
+      '/v1/portfolios/{id}/artworks/{aid}': { delete: { summary: 'Remove an artwork', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'aid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
       '/v1/workflows/{id}': { get: { summary: 'Workflow status with per-step results', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
       '/v1/workflows/{id}/files/{name}': { get: { summary: 'Download a step output file', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'name', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'file bytes' } } } },
     },
@@ -428,14 +458,14 @@ app.post('/v1/developers/signup', async (req, res) => {
 });
 
 // ---------- auth middleware ----------
-const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows'];
+const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios'];
 
 app.use('/v1', async (req, res, next) => {
   const key = req.headers['x-api-key'];
   try {
     if (await isValidKey(key)) {
       req.apiKey = key;
-      if (METERED.includes(req.originalUrl.split('?')[0])) {
+      if (req.method === 'POST' && METERED.includes(req.originalUrl.split('?')[0])) {
         const { month, used } = await getUsage(key);
         if (used >= FREE_MONTHLY_LIMIT) {
           return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', month, limit: FREE_MONTHLY_LIMIT, used });
@@ -1052,6 +1082,211 @@ app.get('/v1/workflows/:id/files/:name', (req, res) => {
   fs.createReadStream(p).pipe(res);
 });
 
+
+// ---------- portfolio management service (Phase B) ----------
+// Serves the AI-powered Portfolio Builder for generative artists.
+// Resilient storage: writes hit the database when available and always keep
+// an in-memory mirror; reads prefer the database and fall back to memory.
+const memPortfolios = new Map(); // id -> portfolio row
+const memArtworks = new Map();   // id -> artwork row
+
+async function pfSave(p) {
+  memPortfolios.set(p.id, p);
+  if (!pool || dbBroken) return;
+  try {
+    await pool.query(
+      'INSERT INTO portfolios (id, key, title, description, artist, published, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET title=$3, description=$4, artist=$5, published=$6, updated_at=$8',
+      [p.id, p.key, p.title, p.description || null, p.artist || null, p.published, p.created_at, p.updated_at]
+    );
+  } catch (e) { console.error('portfolio persist failed:', e.message); }
+}
+
+async function pfList(key) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM portfolios WHERE key = $1 ORDER BY created_at DESC', [key]);
+      if (r.rowCount) return r.rows;
+    } catch (e) { console.error('portfolio list failed:', e.message); }
+  }
+  return [...memPortfolios.values()].filter(p => p.key === key).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+}
+
+async function pfGet(id) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM portfolios WHERE id = $1', [id]);
+      if (r.rowCount) return r.rows[0];
+    } catch (e) { console.error('portfolio get failed:', e.message); }
+  }
+  return memPortfolios.get(id) || null;
+}
+
+async function pfDelete(id) {
+  memPortfolios.delete(id);
+  for (const [aid, a] of [...memArtworks]) if (a.portfolio_id === id) memArtworks.delete(aid);
+  if (pool && !dbBroken) {
+    try { await pool.query('DELETE FROM artworks WHERE portfolio_id = $1', [id]); await pool.query('DELETE FROM portfolios WHERE id = $1', [id]); }
+    catch (e) { console.error('portfolio delete failed:', e.message); }
+  }
+}
+
+async function awSave(a) {
+  memArtworks.set(a.id, a);
+  if (!pool || dbBroken) return;
+  try {
+    await pool.query(
+      'INSERT INTO artworks (id, portfolio_id, key, title, description, image_url, prompt, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET title=$4, description=$5, image_url=$6',
+      [a.id, a.portfolio_id, a.key, a.title, a.description || null, a.image_url, a.prompt || null, a.created_at]
+    );
+  } catch (e) { console.error('artwork persist failed:', e.message); }
+}
+
+async function awList(portfolioId) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM artworks WHERE portfolio_id = $1 ORDER BY created_at DESC', [portfolioId]);
+      if (r.rowCount) return r.rows;
+    } catch (e) { console.error('artwork list failed:', e.message); }
+  }
+  return [...memArtworks.values()].filter(a => a.portfolio_id === portfolioId).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+}
+
+async function awGet(id) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM artworks WHERE id = $1', [id]);
+      if (r.rowCount) return r.rows[0];
+    } catch (e) { console.error('artwork get failed:', e.message); }
+  }
+  return memArtworks.get(id) || null;
+}
+
+async function awDelete(id) {
+  memArtworks.delete(id);
+  if (pool && !dbBroken) {
+    try { await pool.query('DELETE FROM artworks WHERE id = $1', [id]); }
+    catch (e) { console.error('artwork delete failed:', e.message); }
+  }
+}
+
+app.post('/v1/portfolios', async (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 120);
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  const now = new Date().toISOString();
+  const p = {
+    id: crypto.randomUUID(), key: req.apiKey, title,
+    description: String(b.description || '').slice(0, 2000),
+    artist: String(b.artist || '').slice(0, 120) || null,
+    published: !!b.published, created_at: now, updated_at: now,
+  };
+  await pfSave(p);
+  res.status(201).json({ ...p, artworks_url: '/v1/portfolios/' + p.id + '/artworks', gallery_hint: 'PATCH with {"published": true} then share /gallery/' + p.id });
+});
+
+app.get('/v1/portfolios', async (req, res) => {
+  res.json({ portfolios: await pfList(req.apiKey) });
+});
+
+app.get('/v1/portfolios/:id', async (req, res) => {
+  const p = await pfGet(req.params.id);
+  if (!p || p.key !== req.apiKey) return res.status(404).json({ error: 'portfolio not found' });
+  const artworks = await awList(p.id);
+  res.json({ ...p, artworks: artworks.map(a => ({ id: a.id, title: a.title, description: a.description, image_url: a.image_url, prompt: a.prompt, created_at: a.created_at })) });
+});
+
+app.patch('/v1/portfolios/:id', async (req, res) => {
+  const p = await pfGet(req.params.id);
+  if (!p || p.key !== req.apiKey) return res.status(404).json({ error: 'portfolio not found' });
+  const b = req.body || {};
+  if (b.title !== undefined) p.title = String(b.title).trim().slice(0, 120) || p.title;
+  if (b.description !== undefined) p.description = String(b.description).slice(0, 2000);
+  if (b.artist !== undefined) p.artist = String(b.artist).slice(0, 120) || null;
+  if (b.published !== undefined) p.published = !!b.published;
+  p.updated_at = new Date().toISOString();
+  await pfSave(p);
+  res.json({ ...p, gallery_url: p.published ? '/gallery/' + p.id : null });
+});
+
+app.delete('/v1/portfolios/:id', async (req, res) => {
+  const p = await pfGet(req.params.id);
+  if (!p || p.key !== req.apiKey) return res.status(404).json({ error: 'portfolio not found' });
+  await pfDelete(p.id);
+  res.json({ deleted: true, id: p.id });
+});
+
+app.post('/v1/portfolios/:id/artworks', async (req, res) => {
+  const p = await pfGet(req.params.id);
+  if (!p || p.key !== req.apiKey) return res.status(404).json({ error: 'portfolio not found' });
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 160);
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  let imageUrl = null, prompt = null;
+  if (b.image_url) {
+    if (!/^https:\/\//.test(String(b.image_url))) return res.status(400).json({ error: 'image_url must be https' });
+    imageUrl = String(b.image_url);
+  } else {
+    // generate via the media engine (metered inline: the path is dynamic)
+    const { used } = await getUsage(req.apiKey);
+    if (used >= FREE_MONTHLY_LIMIT) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT, used });
+    const gen = b.generate && typeof b.generate === 'object' ? b.generate : {};
+    const gp = {
+      prompt: gen.prompt || b.prompt || String(title),
+      preset: gen.preset || b.preset || null,
+      width: gen.width || b.width, height: gen.height || b.height,
+      model: gen.model || null, seed: gen.seed || b.seed || null,
+    };
+    try { const out = await wfImage(gp); imageUrl = out.url; prompt = out.prompt; }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    await incrUsage(req.apiKey);
+    res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - 1));
+  }
+  const a = {
+    id: crypto.randomUUID(), portfolio_id: p.id, key: req.apiKey, title,
+    description: String(b.description || '').slice(0, 1000),
+    image_url: imageUrl, prompt, created_at: new Date().toISOString(),
+  };
+  await awSave(a);
+  res.status(201).json(a);
+});
+
+app.delete('/v1/portfolios/:id/artworks/:aid', async (req, res) => {
+  const p = await pfGet(req.params.id);
+  if (!p || p.key !== req.apiKey) return res.status(404).json({ error: 'portfolio not found' });
+  const a = await awGet(req.params.aid);
+  if (!a || a.portfolio_id !== p.id) return res.status(404).json({ error: 'artwork not found' });
+  await awDelete(a.id);
+  res.json({ deleted: true, id: a.id });
+});
+
+// public shareable gallery — no API key required, published portfolios only
+app.get('/gallery/:id', async (req, res) => {
+  const p = await pfGet(req.params.id);
+  if (!p || !p.published) return res.status(404).send('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:system-ui;background:#0E2A2B;color:#F3ECDA;text-align:center;padding:60px 20px"><h2>Gallery not found</h2><p style="color:#8FB3B0">This portfolio is private or does not exist.</p></body></html>');
+  const artworks = await awList(p.id);
+  const cards = artworks.map(a => `<figure style="margin:0;background:#143B3C;border:1px solid #1E4344;border-radius:12px;overflow:hidden"><img src="${a.image_url}" alt="${a.title.replace(/"/g, '&quot;')}" loading="lazy" style="width:100%;display:block;aspect-ratio:1;object-fit:cover"><figcaption style="padding:12px"><strong style="color:#F3ECDA;font-size:.95rem">${a.title}</strong>${a.description ? `<div style="color:#8FB3B0;font-size:.8rem;margin-top:4px">${a.description}</div>` : ''}</figcaption></figure>`).join('\n') || '<p style="color:#8FB3B0">No artworks yet.</p>';
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${p.title} — Portfolio</title>
+<meta property="og:title" content="${p.title}">
+<meta property="og:description" content="${p.artist ? p.artist + ' — ' : ''}${p.title}">
+<style>
+body{margin:0;font-family:system-ui,sans-serif;background:#0E2A2B;color:#F3ECDA}
+.wrap{max-width:1080px;margin:0 auto;padding:40px 20px}
+h1{color:#C9A96A;margin:0 0 6px;font-size:2rem}
+.artist{color:#8FB3B0;margin:0 0 8px}
+.desc{color:#D8CBAF;max-width:640px;margin:0 auto 28px;line-height:1.6}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:20px}
+.foot{margin-top:40px;color:#5E8280;font-size:.8rem}
+.foot a{color:#C9A96A;text-decoration:none}
+</style></head><body><div class="wrap">
+<h1>${p.title}</h1>
+${p.artist ? `<p class="artist">by ${p.artist}</p>` : ''}
+${p.description ? `<p class="desc">${p.description}</p>` : ''}
+<div class="grid">${cards}</div>
+<p class="foot">Powered by <a href="/">Studio API</a> — Al-Haqq Digital</p>
+</div></body></html>`);
+});
 
 // ---------- start ----------
 initDb()

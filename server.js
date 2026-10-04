@@ -39,6 +39,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Text &rarr; Content</td><td><code>POST /v1/content/generate</code></td><td>Shorts scripts, lessons, posts</td></tr>
 <tr><td>Text &rarr; Speech</td><td><code>POST /v1/audio/speak</code></td><td>Natural voice MP3, 300+ voices (en, ar and more), rate control</td></tr>
 <tr><td>Text &rarr; PDF</td><td><code>POST /v1/pdf/generate</code></td><td>Lesson PDFs with vocalized Arabic + grammar sections</td></tr>
+<tr><td>Prompt Presets</td><td><code>/v1/presets</code></td><td>Versioned style + scene presets for consistent generations</td></tr>
 <tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, narration voice per scene, auto-subtitles, webhook callback when done</td></tr>
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
 </table>
@@ -55,6 +56,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>POST</td><td><code>/v1/developers/signup</code></td><td>Get an API key</td></tr>
 <tr><td>GET</td><td><code>/v1/health</code></td><td>Service status (needs key)</td></tr>
 <tr><td>GET</td><td><code>/v1/usage</code></td><td>Your monthly usage and limit</td></tr>
+<tr><td>GET</td><td><code>/v1/openapi.json</code></td><td>Full machine-readable API documentation</td></tr>
 </table>
 <p>Send your key as header <code>x-api-key</code>. Full docs on <a href="https://github.com/zynoraprime2026-dotcom/studio-api">GitHub</a>.</p>
 <div style="margin-top:28px;padding-top:20px;border-top:1px solid #1E4344">
@@ -116,6 +118,16 @@ async function initDb() {
       month TEXT NOT NULL,
       count INT NOT NULL DEFAULT 0,
       PRIMARY KEY (key, month)
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS presets (
+      id TEXT PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      category TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      params JSONB DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 }
@@ -189,6 +201,122 @@ app.get('/v1/db-check', async (req, res) => {
   res.json(out);
 });
 
+
+// ---------- prompt/parameter presets ----------
+const BUILTIN_PRESETS = [
+  { id: 'abstract-gold', category: 'artist-style', name: 'abstract-gold', prompt: 'abstract modern islamic art, flowing gold and deep teal, luxurious, museum quality, high detail', params: { width: 1024, height: 1024 } },
+  { id: 'arabic-calligraphy', category: 'artist-style', name: 'arabic-calligraphy', prompt: 'elegant arabic calligraphy artwork, gold ink on dark emerald background, ornate, master calligrapher style', params: { width: 1024, height: 1024 } },
+  { id: 'geometric-pattern', category: 'artist-style', name: 'geometric-pattern', prompt: 'intricate islamic geometric pattern, girih tiles, gold and midnight blue, symmetrical, crisp vector-like edges', params: { width: 1024, height: 1024 } },
+  { id: 'quran-short-card', category: 'scene-style', name: 'quran-short-card', prompt: 'vertical youtube short scene card, deep teal background with subtle geometric pattern, centered arabic calligraphy in gold, cinematic lighting', params: { width: 1080, height: 1920 } },
+  { id: 'game-character', category: 'game-asset', name: 'game-character', prompt: 'game character concept art, full body, clean background, stylized, consistent character design sheet', params: { width: 1024, height: 1536 } },
+  { id: 'game-scene-bg', category: 'game-asset', name: 'game-scene-bg', prompt: 'game scene background art, wide establishing shot, atmospheric, game-ready composition', params: { width: 1536, height: 864 } },
+];
+const memoryPresets = new Map(); // id -> { id, name, category, prompt, params }
+
+async function listPresets() {
+  let custom = [];
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT id, name, category, prompt, params FROM presets');
+      custom = r.rows.map(x => ({ id: x.id, name: x.name, category: x.category, prompt: x.prompt, params: x.params || {} }));
+    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('preset list failed, memory mode:', e.message); }
+  }
+  if (!custom.length) custom = [...memoryPresets.values()];
+  return BUILTIN_PRESETS.concat(custom);
+}
+
+async function findPreset(ref) {
+  const all = await listPresets();
+  return all.find(p => p.id === ref || p.name === ref) || null;
+}
+
+async function createPreset(name, category, prompt, params) {
+  const id = 'p_' + crypto.randomBytes(8).toString('hex');
+  if (pool && !dbBroken) {
+    try {
+      await pool.query('INSERT INTO presets (id, name, category, prompt, params) VALUES ($1,$2,$3,$4,$5)', [id, name, category, prompt, JSON.stringify(params || {})]);
+      return { id, name, category, prompt, params: params || {} };
+    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('preset save failed, memory mode:', e.message); }
+  }
+  const p = { id, name, category, prompt, params: params || {} };
+  memoryPresets.set(id, p);
+  return p;
+}
+
+async function deletePreset(id) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('DELETE FROM presets WHERE id = $1 AND id NOT LIKE $2', [id, 'builtin%']);
+      return r.rowCount > 0 || memoryPresets.delete(id);
+    } catch (e) { lastDbError = e.message; dbBroken = true; }
+  }
+  return memoryPresets.delete(id);
+}
+
+// preset endpoints
+app.get('/v1/presets', async (req, res) => {
+  let all = await listPresets();
+  if (req.query.category) all = all.filter(p => p.category === req.query.category);
+  res.json({ presets: all, count: all.length });
+});
+
+app.post('/v1/presets', async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim().toLowerCase().replace(/\s+/g, '-');
+  const prompt = String(b.prompt || '').trim();
+  if (!name || !prompt) return res.status(400).json({ error: 'name and prompt are required' });
+  if (BUILTIN_PRESETS.some(p => p.name === name)) return res.status(409).json({ error: 'that name is reserved by a built-in preset' });
+  if ((await findPreset(name))) return res.status(409).json({ error: 'a preset with that name already exists' });
+  const p = await createPreset(name, String(b.category || 'custom'), prompt.slice(0, 2000), typeof b.params === 'object' && b.params ? b.params : {});
+  res.status(201).json({ message: 'preset created', preset: p });
+});
+
+app.get('/v1/presets/:ref', async (req, res) => {
+  const p = await findPreset(req.params.ref);
+  if (!p) return res.status(404).json({ error: 'preset not found' });
+  res.json({ preset: p });
+});
+
+app.delete('/v1/presets/:ref', async (req, res) => {
+  const p = await findPreset(req.params.ref);
+  if (!p) return res.status(404).json({ error: 'preset not found' });
+  if (BUILTIN_PRESETS.some(b => b.id === p.id)) return res.status(400).json({ error: 'built-in presets cannot be deleted' });
+  const ok = await deletePreset(p.id);
+  res.status(ok ? 200 : 404).json(ok ? { deleted: p.id } : { error: 'delete failed' });
+});
+
+// ---------- OpenAPI documentation ----------
+app.get('/v1/openapi.json', (req, res) => {
+  res.json({
+    openapi: '3.0.3',
+    info: { title: 'Studio API', version: '1.3.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
+    servers: [{ url: 'https://studio-api-nqpm.onrender.com' }],
+    components: {
+      securitySchemes: { ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' } },
+      schemas: {
+        Scene: { type: 'object', properties: { image: { type: 'string', description: 'image URL for the scene' }, text: { type: 'string', description: 'text card content' }, narration: { type: 'string', description: 'spoken audio for the scene (auto-timed)' }, duration: { type: 'number' }, subtitles: { type: 'boolean' } } },
+        Preset: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, category: { type: 'string' }, prompt: { type: 'string' }, params: { type: 'object' } } },
+      },
+    },
+    paths: {
+      '/v1/developers/signup': { post: { summary: 'Create an API key', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['email'], properties: { email: { type: 'string' } } } } } }, responses: { '200': { description: 'key created' } } } },
+      '/v1/usage': { get: { summary: 'Monthly usage and limit', responses: { '200': { description: 'ok' } } } },
+      '/v1/db-check': { get: { summary: 'Database connection diagnostic', responses: { '200': { description: 'ok' } } } },
+      '/v1/image/generate': { post: { summary: 'Generate an image from text (or a preset)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { prompt: { type: 'string' }, preset: { type: 'string', description: 'preset name or id; combined with prompt if both given' }, width: { type: 'integer' }, height: { type: 'integer' }, model: { type: 'string' }, seed: { type: 'integer' } } } } } }, responses: { '200': { description: 'image URL' } } } },
+      '/v1/video/render': { post: { summary: 'Render a scene-based MP4 (narration, subtitles, webhook)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { title: { type: 'string' }, subtitles: { type: 'boolean' }, webhook: { type: 'string', description: 'https URL called when the render finishes or fails' }, scenes: { type: 'array', items: { '$ref': '#/components/schemas/Scene' } } } } } } }, responses: { '200': { description: 'job_id; poll /v1/video/status/:id' } } } },
+      '/v1/video/status/{id}': { get: { summary: 'Render job status', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'status' } } } },
+      '/v1/video/file/{id}': { get: { summary: 'Download finished MP4', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'video bytes' } } } },
+      '/v1/video/thumbnail/{id}': { get: { summary: 'Branded cover image from a finished video', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'at', in: 'query', schema: { type: 'number' }, description: 'frame time in seconds' }, { name: 'text', in: 'query', schema: { type: 'string' }, description: 'title overlay' }], responses: { '200': { description: 'jpeg bytes' } } } },
+      '/v1/audio/speak': { post: { summary: 'Text to speech MP3', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['text'], properties: { text: { type: 'string' }, voice: { type: 'string', description: 'e.g. en-US-GuyNeural, ar-SA-HamedNeural' }, rate: { type: 'string', description: 'e.g. +10%' } } } } } }, responses: { '200': { description: 'audio/mpeg bytes' } } } },
+      '/v1/pdf/generate': { post: { summary: 'Lesson PDF with vocalized Arabic + grammar sections', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['title', 'sections'], properties: { title: { type: 'string' }, subtitle: { type: 'string' }, footer: { type: 'string' }, sections: { type: 'array', items: { type: 'object', properties: { heading: { type: 'string' }, body: { type: 'string' } } } } } } } } }, responses: { '200': { description: 'application/pdf bytes' } } } },
+      '/v1/presets': { get: { summary: 'List prompt presets (filter by ?category=)', responses: { '200': { description: 'ok' } } }, post: { summary: 'Create a prompt preset', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['name', 'prompt'], properties: { name: { type: 'string' }, category: { type: 'string' }, prompt: { type: 'string' }, params: { type: 'object' } } } } } }, responses: { '201': { description: 'created' } } } },
+      '/v1/presets/{ref}': { get: { summary: 'Get one preset', parameters: [{ name: 'ref', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete a custom preset', parameters: [{ name: 'ref', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
+      '/v1/content/generate': { post: { summary: 'Generate shorts scripts, lessons, or social posts', responses: { '200': { description: 'ok' } } } },
+    },
+    security: [{ ApiKeyAuth: [] }],
+  });
+});
+
 // ---------- developer signup (same pattern as Ilm API) ----------
 app.post('/v1/developers/signup', async (req, res) => {
   const email = (req.body && req.body.email || '').trim().toLowerCase();
@@ -235,15 +363,22 @@ app.get('/v1/health', (req, res) => res.json({ status: 'ok', service: 'studio-ap
 
 // ---------- image generation (free provider: Pollinations, no key needed) ----------
 app.post('/v1/image/generate', async (req, res) => {
-  const { prompt, width, height, model, seed } = req.body || {};
-  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt is required' });
-  const w = Math.min(Math.max(parseInt(width) || 1024, 256), 1920);
-  const h = Math.min(Math.max(parseInt(height) || 1024, 256), 1920);
+  const { prompt, preset, width, height, model, seed } = req.body || {};
+  let basePrompt = (typeof prompt === 'string') ? prompt : '';
+  let resolved = null;
+  if (preset) {
+    resolved = await findPreset(String(preset));
+    if (!resolved) return res.status(404).json({ error: 'preset not found: ' + preset });
+    basePrompt = basePrompt ? resolved.prompt + ', ' + basePrompt : resolved.prompt;
+  }
+  if (!basePrompt) return res.status(400).json({ error: 'prompt or preset is required' });
+  const w = Math.min(Math.max(parseInt(width) || (resolved && resolved.params && resolved.params.width) || 1024, 256), 1920);
+  const h = Math.min(Math.max(parseInt(height) || (resolved && resolved.params && resolved.params.height) || 1024, 256), 1920);
   const params = new URLSearchParams({ width: String(w), height: String(h), nologo: 'true' });
   if (model) params.set('model', model);
   if (seed) params.set('seed', String(seed));
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
-  res.json({ url, prompt, width: w, height: h, note: 'URL serves the generated image directly' });
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(basePrompt)}?${params}`;
+  res.json({ url, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, note: 'URL serves the generated image directly' });
 });
 
 // ---------- video rendering ----------

@@ -100,53 +100,82 @@ if (process.env.DATABASE_URL) {
 }
 
 // Supabase fix: direct db.<ref>.supabase.co hosts are IPv6-only (unreachable from
-// hosts without IPv6 egress, like Render). Build a candidate list: if the URL is a
-// direct supabase address, add both IPv4 session poolers ahead of it; then probe
-// each and use whichever actually connects.
-function dbCandidates(raw) {
-  const list = [raw];
+// hosts without IPv6 egress, like Render), and the pooler region may not match the
+// project's actual region. So: extract the project ref from the URL and probe every
+// Supabase pooler region (aws-0/aws-1, ports 5432 and 443) in parallel, then
+// connect through whichever answers. Falls back to the original URL last.
+const POOLER_REGIONS = [
+  'aws-1-eu-central-1', 'aws-0-eu-central-1',
+  'aws-1-eu-west-1', 'aws-0-eu-west-1', 'aws-1-eu-west-2', 'aws-0-eu-west-2', 'aws-1-eu-west-3', 'aws-0-eu-west-3',
+  'aws-1-us-east-1', 'aws-0-us-east-1', 'aws-1-us-east-2', 'aws-0-us-east-2',
+  'aws-1-us-west-1', 'aws-0-us-west-1', 'aws-1-us-west-2', 'aws-0-us-west-2',
+  'aws-1-ap-southeast-1', 'aws-0-ap-southeast-1', 'aws-1-ap-southeast-2', 'aws-0-ap-southeast-2',
+  'aws-1-ap-northeast-1', 'aws-0-ap-northeast-1', 'aws-1-ap-south-1', 'aws-0-ap-south-1',
+  'aws-1-ca-central-1', 'aws-0-ca-central-1', 'aws-1-sa-east-1', 'aws-0-sa-east-1',
+];
+
+function extractRef(raw) {
   try {
     const u = new URL(raw);
     const m = u.hostname.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
-    if (m) {
-      const ref = m[1];
-      for (const region of ['aws-1', 'aws-0']) {
-        const c = new URL(raw);
-        c.username = 'postgres.' + ref;
-        c.hostname = region + '-eu-central-1.pooler.supabase.com';
-        list.unshift(c.toString());
-      }
-    }
-  } catch (e) { /* keep original */ }
+    if (m) return m[1];
+    const um = u.username.match(/^postgres\.([a-z0-9]+)$/i);
+    if (um) return um[1];
+  } catch (e) {}
+  return null;
+}
+
+function buildCandidates(raw) {
+  const list = [];
+  const ref = extractRef(raw);
+  if (ref) {
+    const pw = new URL(raw).password;
+    for (const region of POOLER_REGIONS) list.push('postgresql://postgres.' + ref + ':' + pw + '@' + region + '.pooler.supabase.com:5432/postgres');
+    for (const region of POOLER_REGIONS) list.push('postgresql://postgres.' + ref + ':' + pw + '@' + region + '.pooler.supabase.com:443/postgres');
+  }
+  list.push(raw); // original URL, lowest priority
   return list;
+}
+
+async function probe(cand) {
+  const c = new pg.Client({ connectionString: cand, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 9000 });
+  await c.connect();
+  await c.end();
+  return cand;
 }
 
 let pool = null;
 let activeDbUrl = null;
+let dbProbeErrors = [];
 async function connectDb() {
   if (!pg || !process.env.DATABASE_URL) return false;
-  for (const cand of dbCandidates(process.env.DATABASE_URL)) {
-    const c = new pg.Client({ connectionString: cand, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 10000 });
-    try {
-      await c.connect();
-      await c.end();
-      activeDbUrl = cand;
-      pool = new pg.Pool({ connectionString: cand, ssl: { rejectUnauthorized: false } });
-      dbBroken = false;
-      lastDbError = null;
-      console.log('DB connected via:', new URL(cand).hostname);
-      return true;
-    } catch (e) {
-      try { await c.end(); } catch (_) {}
-      console.log('DB candidate failed:', new URL(cand).hostname, '-', e.code || e.message);
-      lastDbError = e.message;
+  const cands = buildCandidates(process.env.DATABASE_URL);
+  const results = await Promise.allSettled(cands.map(c => probe(c)));
+  let winner = null;
+  dbProbeErrors = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled' && !winner) winner = r.value;
+    if (r.status === 'rejected') {
+      let host = '?';
+      try { host = new URL(cands[i]).hostname; } catch (e) {}
+      dbProbeErrors.push(host + ' -> ' + String((r.reason && (r.reason.code || r.reason.message)) || r.reason).slice(0, 80));
     }
+  });
+  if (winner) {
+    activeDbUrl = winner;
+    pool = new pg.Pool({ connectionString: winner, ssl: { rejectUnauthorized: false } });
+    dbBroken = false;
+    lastDbError = null;
+    console.log('DB connected via:', new URL(winner).hostname, new URL(winner).port);
+    return true;
   }
   dbBroken = true;
   pool = null;
-  console.log('DB unreachable on all candidates; memory mode');
+  lastDbError = dbProbeErrors.slice(0, 4).join(' | ');
+  console.log('DB unreachable on all ' + cands.length + ' candidates; memory mode');
   return false;
 }
+
 const memoryKeys = new Map(); // key -> { email, created_at }
 
 async function initDb() {
@@ -235,7 +264,7 @@ async function incrUsage(key) {
 // diagnostic: shows whether the DB connection is healthy
 app.get('/v1/db-check', async (req, res) => {
   if (!pool) await connectDb(); // self-heal: re-probe candidates if connection was lost at boot
-  const out = { db_configured: !!pool, active_host: activeDbUrl ? new URL(activeDbUrl).hostname : null, last_error: lastDbError ? String(lastDbError).slice(0, 300) : null, live: null };
+  const out = { db_configured: !!pool, active_host: activeDbUrl ? new URL(activeDbUrl).hostname + ':' + new URL(activeDbUrl).port : null, probe_errors: dbProbeErrors.slice(0, 8), last_error: lastDbError ? String(lastDbError).slice(0, 300) : null, live: null };
   if (pool) {
     try {
       const r = await pool.query('SELECT 1 AS ok');

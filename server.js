@@ -42,6 +42,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Prompt Presets</td><td><code>/v1/presets</code></td><td>Versioned style + scene presets for consistent generations</td></tr>
 <tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, narration voice per scene, auto-subtitles, webhook callback when done</td></tr>
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
+<tr><td>Multi-step Workflows</td><td><code>POST /v1/workflows</code></td><td>Chain steps (image &rarr; speech &rarr; animate); later steps reuse earlier outputs via <code>{{s1.url}}</code></td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
 <table>
@@ -49,6 +50,8 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>GET</td><td><code>/v1/video/status/:id</code></td><td>Render progress</td></tr>
 <tr><td>GET</td><td><code>/v1/video/file/:id</code></td><td>Download finished MP4</td></tr>
 <tr><td>GET</td><td><code>/v1/video/thumbnail/:id</code></td><td>Branded cover image from a finished video</td></tr>
+<tr><td>GET</td><td><code>/v1/workflows/:id</code></td><td>Workflow progress &amp; step outputs</td></tr>
+<tr><td>GET</td><td><code>/v1/workflows/:id/files/:name</code></td><td>Download step output files</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">ACCOUNT</h3>
 <table>
@@ -196,6 +199,18 @@ async function initDb() {
       month TEXT NOT NULL,
       count INT NOT NULL DEFAULT 0,
       PRIMARY KEY (key, month)
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS workflows (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      name TEXT,
+      status TEXT NOT NULL,
+      steps JSONB DEFAULT '[]',
+      error TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
   await pool.query(`
@@ -368,7 +383,7 @@ app.delete('/v1/presets/:ref', async (req, res) => {
 app.get('/v1/openapi.json', (req, res) => {
   res.json({
     openapi: '3.0.3',
-    info: { title: 'Studio API', version: '1.3.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
+    info: { title: 'Studio API', version: '1.4.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
     servers: [{ url: 'https://studio-api-nqpm.onrender.com' }],
     components: {
       securitySchemes: { ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' } },
@@ -391,6 +406,10 @@ app.get('/v1/openapi.json', (req, res) => {
       '/v1/presets': { get: { summary: 'List prompt presets (filter by ?category=)', responses: { '200': { description: 'ok' } } }, post: { summary: 'Create a prompt preset', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['name', 'prompt'], properties: { name: { type: 'string' }, category: { type: 'string' }, prompt: { type: 'string' }, params: { type: 'object' } } } } } }, responses: { '201': { description: 'created' } } } },
       '/v1/presets/{ref}': { get: { summary: 'Get one preset', parameters: [{ name: 'ref', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete a custom preset', parameters: [{ name: 'ref', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
       '/v1/content/generate': { post: { summary: 'Generate shorts scripts, lessons, or social posts', responses: { '200': { description: 'ok' } } } },
+      '/v1/workflows': { post: { summary: 'Run a multi-step generation workflow (image, speech, animate, content steps; outputs chain forward via {{stepId.field}})', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['steps'], properties: { name: { type: 'string' }, webhook: { type: 'string', description: 'https URL called on completion or failure' }, steps: { type: 'array', maxItems: 20, items: { type: 'object', required: ['action'], properties: { id: { type: 'string', description: 'reference id, default s1, s2... used in {{id.field}} templates' }, action: { type: 'string', enum: ['image', 'speech', 'animate', 'content'] }, params: { type: 'object', description: 'action-specific params; strings may embed {{stepId.field}} references to earlier outputs' } } } } } } } } }, responses: { '202': { description: 'workflow queued; poll /v1/workflows/{id}' } } } },
+      '/v1/workflows/list': { get: { summary: 'List your recent workflows', responses: { '200': { description: 'ok' } } } },
+      '/v1/workflows/{id}': { get: { summary: 'Workflow status with per-step results', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
+      '/v1/workflows/{id}/files/{name}': { get: { summary: 'Download a step output file', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'name', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'file bytes' } } } },
     },
     security: [{ ApiKeyAuth: [] }],
   });
@@ -409,7 +428,7 @@ app.post('/v1/developers/signup', async (req, res) => {
 });
 
 // ---------- auth middleware ----------
-const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate'];
+const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows'];
 
 app.use('/v1', async (req, res, next) => {
   const key = req.headers['x-api-key'];
@@ -797,15 +816,12 @@ app.get('/v1/video/thumbnail/:id', async (req, res) => {
 
 // ---------- content creation ----------
 // POST /v1/content/generate { type: 'shorts_script'|'lesson'|'social_post', topic, tone? }
-app.post('/v1/content/generate', (req, res) => {
-  const { type, topic, audience } = req.body || {};
-  if (!topic) return res.status(400).json({ error: 'topic is required' });
-  const t = (type || 'shorts_script').toLowerCase();
-  const a = audience || 'general Muslim audience';
+function buildContent(t, topic, a) {
+  if (!topic) return null;
   const title = topic.replace(/\b\w/g, (c) => c.toUpperCase());
 
   if (t === 'shorts_script') {
-    return res.json({
+    return {
       type: 'shorts_script', topic,
       hook: `Stop scrolling. ${title} — explained in 60 seconds.`,
       scenes: [
@@ -817,10 +833,10 @@ app.post('/v1/content/generate', (req, res) => {
       ],
       caption: `${title} explained. #islam #islamic #muslim #quran #shorts`,
       note: 'Pair with GET /v1/quran/* and /v1/hadith/* on the Ilm API to fill in authentic evidence.',
-    });
+    };
   }
   if (t === 'lesson') {
-    return res.json({
+    return {
       type: 'lesson', topic,
       outline: {
         objectives: [`Understand the meaning of ${topic}`, 'Memorize key Arabic terms with harakaat', 'Apply the lesson practically'],
@@ -828,20 +844,214 @@ app.post('/v1/content/generate', (req, res) => {
         homework: [`Write the Arabic text of ${topic} from memory`, 'Prepare 3 questions for the next class'],
       },
       note: 'Enrich with Ilm API: /v1/quran, /v1/tafsir, /v1/hadith, /v1/duas.',
-    });
+    };
   }
   if (t === 'social_post') {
-    return res.json({
+    return {
       type: 'social_post', topic,
       posts: {
         whatsapp: `${title}\n\nA short, beneficial reminder about ${topic} for ${a}. Keep it sincere and sourced.`,
         x_twitter: `${title} — a thread. 1/`,
         instagram_caption: `${title} ✨ Swipe for the full reminder. #islamicreminder #deen`,
       },
+    };
+  }
+  return null;
+}
+
+// ---------- content creation ----------
+app.post('/v1/content/generate', (req, res) => {
+  const { type, topic, audience } = req.body || {};
+  if (!topic) return res.status(400).json({ error: 'topic is required' });
+  const result = buildContent(String(type || 'shorts_script').toLowerCase(), String(topic).trim(), audience || 'general Muslim audience');
+  if (!result) return res.status(400).json({ error: 'type must be shorts_script, lesson, or social_post' });
+  res.json(result);
+});
+
+// ---------- workflow engine (chained multi-step generation) ----------
+// POST /v1/workflows { name?, steps: [{ id?, action: 'image'|'speech'|'animate'|'content', params: {...} }], webhook? }
+// Later steps reference earlier outputs with {{stepId.field}} template strings.
+const WF_ACTIONS = ['image', 'speech', 'animate', 'content'];
+const wfJobs = new Map(); // id -> job object
+
+function resolveTemplates(value, results) {
+  if (typeof value === 'string') {
+    return value.replace(/\{\{\s*([A-Za-z][\w-]*(?:\.[\w-]+)*)\s*\}\}/g, (m, ref) => {
+      const parts = ref.split('.');
+      const out = results[parts.shift()];
+      let v = out;
+      for (const p of parts) v = (v && typeof v === 'object') ? v[p] : undefined;
+      return (v === undefined || v === null) ? m : String(v);
     });
   }
-  res.status(400).json({ error: 'type must be shorts_script, lesson, or social_post' });
+  if (Array.isArray(value)) return value.map(v => resolveTemplates(v, results));
+  if (value && typeof value === 'object') { const o = {}; for (const k of Object.keys(value)) o[k] = resolveTemplates(value[k], results); return o; }
+  return value;
+}
+
+async function wfSaveDb(job) {
+  if (!pool || dbBroken) return;
+  try {
+    await pool.query(
+      'INSERT INTO workflows (id, key, name, status, steps, error) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET status=$4, steps=$5, error=$6, updated_at=NOW()',
+      [job.id, job.key, job.name || null, job.status, JSON.stringify(job.steps), job.error || null]
+    );
+  } catch (e) { console.error('workflow persist failed:', e.message); }
+}
+
+async function wfImage(p) {
+  let basePrompt = (typeof p.prompt === 'string') ? p.prompt : '';
+  let resolved = null;
+  if (p.preset) {
+    resolved = await findPreset(String(p.preset));
+    if (!resolved) throw new Error('preset not found: ' + p.preset);
+    basePrompt = basePrompt ? resolved.prompt + ', ' + basePrompt : resolved.prompt;
+  }
+  if (!basePrompt) throw new Error('image step needs prompt or preset');
+  const w = Math.min(Math.max(parseInt(p.width) || (resolved && resolved.params && resolved.params.width) || 1024, 256), 1920);
+  const h = Math.min(Math.max(parseInt(p.height) || (resolved && resolved.params && resolved.params.height) || 1024, 256), 1920);
+  const qs = new URLSearchParams({ width: String(w), height: String(h), nologo: 'true' });
+  if (p.model) qs.set('model', String(p.model));
+  if (p.seed) qs.set('seed', String(p.seed));
+  const url = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(basePrompt) + '?' + qs;
+  return { url, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h };
+}
+
+async function wfSpeech(p, job, dir, idx) {
+  const text = String(p.text || '').trim();
+  if (!text) throw new Error('speech step needs text');
+  const voice = VOICE_RE.test(String(p.voice || '')) ? p.voice : DEFAULT_VOICE;
+  const fname = 's' + idx + '.mp3';
+  await speakText(text, voice, p.rate, path.join(dir, fname));
+  return { url: job.baseUrl + '/v1/workflows/' + job.id + '/files/' + fname, text, voice, file: fname };
+}
+
+async function wfAnimate(p, job, dir, idx) {
+  const imageUrl = p.image_url || p.image;
+  if (!imageUrl || !/^https:\/\//.test(String(imageUrl))) throw new Error('animate step needs an https image_url');
+  const duration = Math.min(Math.max(parseFloat(p.duration) || 8, 2), 30);
+  const effect = KB_EFFECTS.includes(p.effect) ? p.effect : 'zoom_in';
+  const isWide = p.aspect === 'wide' || p.aspect === 'landscape';
+  const W = isWide ? 1280 : 1080, H = isWide ? 720 : 1920, FPS = 30;
+  const caption = (p.text && String(p.text).trim()) ? String(p.text).trim() : null;
+  const imgPath = path.join(dir, 'anim' + idx + '.img');
+  await downloadImage(String(imageUrl), imgPath);
+  const fname = 's' + idx + '.mp4';
+  const outPath = path.join(dir, fname);
+  const N = Math.round(duration * FPS);
+  let z, x, y;
+  switch (effect) {
+    case 'zoom_out': z = 'max(1.25-' + (0.25 / N).toFixed(6) + '*in,1.0)'; x = 'iw/2-(iw/zoom/2)'; y = 'ih/2-(ih/zoom/2)'; break;
+    case 'pan_left': z = '1.25'; x = '(iw-iw/zoom)*max(1-in/' + N + ',0)'; y = 'ih/2-(ih/zoom/2)'; break;
+    case 'pan_right': z = '1.25'; x = '(iw-iw/zoom)*min(in/' + N + ',1)'; y = 'ih/2-(ih/zoom/2)'; break;
+    case 'static': z = '1'; x = '0'; y = '0'; break;
+    default: z = 'min(1+' + (0.25 / N).toFixed(6) + '*in,1.25)'; x = 'iw/2-(iw/zoom/2)'; y = 'ih/2-(ih/zoom/2)';
+  }
+  const parts = ['scale=' + Math.round(W * 1.5) + ':' + Math.round(H * 1.5) + ':force_original_aspect_ratio=increase', 'crop=' + Math.round(W * 1.5) + ':' + Math.round(H * 1.5)];
+  if (effect === 'static') parts.push('scale=' + W + ':' + H);
+  else parts.push("zoompan=z='" + z + "':x='" + x + "':y='" + y + "':d=1:s=" + W + 'x' + H + ':fps=' + FPS);
+  if (caption) {
+    const size = Math.max(28, Math.round(W / 18));
+    parts.push('drawtext=fontfile=' + FONT + ":text='" + escDrawtext(caption) + "':fontcolor=#F3ECDA:fontsize=" + size + ':line_spacing=' + Math.round(size * 0.5) + ':x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=#0E2A2B@0.65:boxborderw=24');
+  }
+  parts.push('format=yuv420p');
+  await execFileAsync('ffmpeg', ['-y', '-loop', '1', '-framerate', String(FPS), '-t', String(duration), '-i', imgPath, '-vf', parts.join(','), '-r', String(FPS), '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p', outPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+  return { url: job.baseUrl + '/v1/workflows/' + job.id + '/files/' + fname, duration, effect, image: String(imageUrl), file: fname };
+}
+
+function wfContent(p) {
+  const r = buildContent(String(p.type || 'shorts_script').toLowerCase(), String(p.topic || '').trim(), String(p.audience || 'general Muslim audience'));
+  if (!r) throw new Error('content step: type must be shorts_script, lesson, or social_post');
+  if (!r.topic) throw new Error('content step needs a topic');
+  return r;
+}
+
+const WF_RUNNERS = { image: wfImage, speech: wfSpeech, animate: wfAnimate, content: wfContent };
+
+async function runWorkflow(job, rawSteps) {
+  const results = {};
+  const dir = path.join(WORK_DIR, 'workflows', job.id);
+  fs.mkdirSync(dir, { recursive: true });
+  job.status = 'running';
+  try {
+    for (let i = 0; i < rawSteps.length; i++) {
+      const step = job.steps[i];
+      const p = resolveTemplates(rawSteps[i].params || {}, results);
+      const output = await WF_RUNNERS[step.action](p, job, dir, i);
+      step.status = 'done';
+      step.output = output;
+      results[step.id] = output;
+      job.progress = Math.round(((i + 1) / rawSteps.length) * 100);
+      wfSaveDb(job);
+    }
+    job.status = 'done';
+    job.progress = 100;
+  } catch (e) {
+    job.status = 'failed';
+    job.error = e.message;
+    const failed = job.steps.find(s => s.status === 'pending');
+    if (failed) { failed.status = 'failed'; failed.error = e.message; }
+  }
+  wfSaveDb(job);
+  if (job.webhook) {
+    fetch(job.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event: job.status === 'done' ? 'workflow.completed' : 'workflow.failed', workflow_id: job.id, status: job.status, error: job.error || null, steps: job.steps.map(s => ({ id: s.id, action: s.action, status: s.status, output: s.output || null })) }) })
+      .catch(e => console.error('workflow webhook failed:', e.message));
+  }
+}
+
+app.post('/v1/workflows', async (req, res) => {
+  const b = req.body || {};
+  const rawSteps = Array.isArray(b.steps) ? b.steps : null;
+  if (!rawSteps || rawSteps.length === 0) return res.status(400).json({ error: 'steps array with at least one step is required' });
+  if (rawSteps.length > 20) return res.status(400).json({ error: 'too many steps (max 20)' });
+  const seen = new Set();
+  for (let i = 0; i < rawSteps.length; i++) {
+    const st = rawSteps[i] || {};
+    if (!WF_ACTIONS.includes(st.action)) return res.status(400).json({ error: 'step ' + (i + 1) + ': action must be one of ' + WF_ACTIONS.join(', ') });
+    let id = st.id ? String(st.id) : 's' + (i + 1);
+    if (!/^[a-zA-Z][\w-]{0,39}$/.test(id)) return res.status(400).json({ error: 'step ' + (i + 1) + ': invalid id (letters, digits, - _)' });
+    if (seen.has(id)) return res.status(400).json({ error: 'step ' + (i + 1) + ': duplicate id ' + id });
+    seen.add(id);
+    rawSteps[i].id = id;
+  }
+  const hook = /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(b.webhook || '')) ? String(b.webhook) : null;
+  const id = crypto.randomUUID();
+  const job = {
+    id, key: req.apiKey, name: b.name ? String(b.name).slice(0, 120) : null,
+    status: 'queued', progress: 0, error: null, webhook: hook,
+    baseUrl: 'https://' + req.get('host'),
+    createdAt: Date.now(),
+    steps: rawSteps.map(st => ({ id: st.id, action: st.action, status: 'pending', output: null, error: null })),
+  };
+  wfJobs.set(id, job);
+  wfSaveDb(job);
+  runWorkflow(job, rawSteps).catch(e => console.error('workflow crashed:', e.message));
+  res.status(202).json({ id, name: job.name, status: 'queued', steps: job.steps.length, poll: '/v1/workflows/' + id, docs: 'later steps can use earlier outputs via {{stepId.field}}' });
 });
+
+app.get('/v1/workflows/list', (req, res) => {
+  const mine = [...wfJobs.values()].filter(j => j.key === req.apiKey).sort((a, b2) => b2.createdAt - a.createdAt).slice(0, 50);
+  res.json({ workflows: mine.map(j => ({ id: j.id, name: j.name, status: j.status, steps: j.steps.length, created_at: new Date(j.createdAt).toISOString() })) });
+});
+
+app.get('/v1/workflows/:id', (req, res) => {
+  const job = wfJobs.get(req.params.id);
+  if (!job || job.key !== req.apiKey) return res.status(404).json({ error: 'workflow not found' });
+  res.json({ id: job.id, name: job.name, status: job.status, progress: job.progress, error: job.error, steps: job.steps, created_at: new Date(job.createdAt).toISOString() });
+});
+
+app.get('/v1/workflows/:id/files/:name', (req, res) => {
+  const job = wfJobs.get(req.params.id);
+  if (!job || job.key !== req.apiKey) return res.status(404).json({ error: 'workflow not found' });
+  const name = String(req.params.name);
+  if (!/^[\w.-]+$/.test(name)) return res.status(400).json({ error: 'invalid file name' });
+  const p = path.join(WORK_DIR, 'workflows', job.id, name);
+  if (!fs.existsSync(p)) return res.status(404).json({ error: 'file not found' });
+  res.setHeader('Content-Type', name.endsWith('.mp3') ? 'audio/mpeg' : 'video/mp4');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + name + '"');
+  fs.createReadStream(p).pipe(res);
+});
+
 
 // ---------- start ----------
 initDb()

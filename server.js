@@ -629,9 +629,9 @@ app.post('/v1/video/render', async (req, res) => {
           const args = ['-y', ...baseInput];
           const vfFull = (sc.image ? vf.join(',') + ',' : '') + parts.join(',');
           if (narrPath) {
-            args.push('-i', narrPath, '-vf', vfFull, '-t', String(dur), '-af', 'apad', '-c:v', 'libx264', '-preset', 'fast', '-c:a', 'aac', '-b:a', '128k', '-shortest', seg);
+            args.push('-i', narrPath, '-vf', vfFull, '-t', String(dur), '-af', 'apad', '-threads', '1', '-filter_threads', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-c:a', 'aac', '-b:a', '128k', '-shortest', seg);
           } else {
-            args.push('-vf', vfFull, '-t', String(dur), '-c:v', 'libx264', '-preset', 'fast', seg);
+            args.push('-vf', vfFull, '-t', String(dur), '-threads', '1', '-filter_threads', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', seg);
           }
           await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
           segFiles.push(seg);
@@ -675,7 +675,7 @@ app.post('/v1/video/render', async (req, res) => {
       const inputArgs = [];
       for (let i = 0; i < inputs.length; i += 2) inputArgs.push(inputs[i], inputs[i + 1]);
       const args = ['-y'];
-      args.push(...inputArgs, '-filter_complex', fc, '-map', '[outv]', '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p', '-r', String(FPS), outPath);
+      args.push(...inputArgs, '-filter_complex', fc, '-map', '[outv]', '-threads', '1', '-filter_threads', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-pix_fmt', 'yuv420p', '-r', String(FPS), outPath);
       await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
       const videoId = jobId;
       jobs.get(jobId).status = 'done';
@@ -737,8 +737,8 @@ app.post('/v1/video/from-image', async (req, res) => {
         parts.push('drawtext=fontfile=' + FONT + ":text='" + escDrawtext(caption) + "':fontcolor=#F3ECDA:fontsize=" + size + ':line_spacing=' + Math.round(size * 0.5) + ':x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=#0E2A2B@0.65:boxborderw=24');
       }
       parts.push('format=yuv420p');
-      const args = ['-y', '-loop', '1', '-framerate', String(FPS), '-t', String(duration), '-i', imgPath,
-        '-vf', parts.join(','), '-r', String(FPS), '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
+      const args = ['-y', '-threads', '1', '-filter_threads', '1', '-loop', '1', '-framerate', String(FPS), '-t', String(duration), '-i', imgPath,
+        '-vf', parts.join(','), '-r', String(FPS), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-pix_fmt', 'yuv420p',
         path.join(jobDir, 'output.mp4')];
       await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
       jobs.get(jobId).status = 'done';
@@ -988,7 +988,7 @@ async function wfAnimate(p, job, dir, idx) {
     case 'static': z = '1'; x = '0'; y = '0'; break;
     default: z = 'min(1+' + (0.25 / N).toFixed(6) + '*in,1.25)'; x = 'iw/2-(iw/zoom/2)'; y = 'ih/2-(ih/zoom/2)';
   }
-  const parts = ['scale=' + Math.round(W * 1.5) + ':' + Math.round(H * 1.5) + ':force_original_aspect_ratio=increase', 'crop=' + Math.round(W * 1.5) + ':' + Math.round(H * 1.5)];
+  const parts = ['scale=' + Math.round(W * 1.3) + ':' + Math.round(H * 1.3) + ':force_original_aspect_ratio=increase', 'crop=' + Math.round(W * 1.3) + ':' + Math.round(H * 1.3)];
   if (effect === 'static') parts.push('scale=' + W + ':' + H);
   else parts.push("zoompan=z='" + z + "':x='" + x + "':y='" + y + "':d=1:s=" + W + 'x' + H + ':fps=' + FPS);
   if (caption) {
@@ -996,7 +996,8 @@ async function wfAnimate(p, job, dir, idx) {
     parts.push('drawtext=fontfile=' + FONT + ":text='" + escDrawtext(caption) + "':fontcolor=#F3ECDA:fontsize=" + size + ':line_spacing=' + Math.round(size * 0.5) + ':x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=#0E2A2B@0.65:boxborderw=24');
   }
   parts.push('format=yuv420p');
-  await execFileAsync('ffmpeg', ['-y', '-loop', '1', '-framerate', String(FPS), '-t', String(duration), '-i', imgPath, '-vf', parts.join(','), '-r', String(FPS), '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p', outPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+  // memory-lean encode for small containers (Render free tier is 512MB)
+  await execFileAsync('ffmpeg', ['-y', '-threads', '1', '-filter_threads', '1', '-loop', '1', '-framerate', String(FPS), '-t', String(duration), '-i', imgPath, '-vf', parts.join(','), '-r', String(FPS), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-pix_fmt', 'yuv420p', outPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
   return { url: job.baseUrl + '/v1/workflows/' + job.id + '/files/' + fname, duration, effect, image: String(imageUrl), file: fname };
 }
 
@@ -1075,10 +1076,24 @@ app.get('/v1/workflows/list', (req, res) => {
   res.json({ workflows: mine.map(j => ({ id: j.id, name: j.name, status: j.status, steps: j.steps.length, created_at: new Date(j.createdAt).toISOString() })) });
 });
 
-app.get('/v1/workflows/:id', (req, res) => {
+app.get('/v1/workflows/:id', async (req, res) => {
   const job = wfJobs.get(req.params.id);
-  if (!job || job.key !== req.apiKey) return res.status(404).json({ error: 'workflow not found' });
-  res.json({ id: job.id, name: job.name, status: job.status, progress: job.progress, error: job.error, steps: job.steps, created_at: new Date(job.createdAt).toISOString() });
+  if (job) {
+    if (job.key !== req.apiKey) return res.status(404).json({ error: 'workflow not found' });
+    return res.json({ id: job.id, name: job.name, status: job.status, progress: job.progress, error: job.error, steps: job.steps, created_at: new Date(job.createdAt).toISOString() });
+  }
+  // server may have restarted; the database keeps the last persisted state
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM workflows WHERE id = $1', [req.params.id]);
+      if (r.rowCount) {
+        const row = r.rows[0];
+        if (row.key !== req.apiKey) return res.status(404).json({ error: 'workflow not found' });
+        return res.json({ id: row.id, name: row.name, status: row.status, progress: row.status === 'done' ? 100 : null, error: row.error, steps: row.steps || [], created_at: row.created_at, note: 'state restored from database (service restarted)' });
+      }
+    } catch (e) { console.error('workflow restore failed:', e.message); }
+  }
+  res.status(404).json({ error: 'workflow not found' });
 });
 
 app.get('/v1/workflows/:id/files/:name', (req, res) => {

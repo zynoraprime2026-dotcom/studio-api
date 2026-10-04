@@ -99,10 +99,59 @@ if (process.env.DATABASE_URL) {
   }
 }
 
-const pool = pg ? new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
+// Supabase fix: direct db.<ref>.supabase.co hosts are IPv6-only (unreachable from
+// hosts without IPv6 egress, like Render). Build a candidate list: if the URL is a
+// direct supabase address, add both IPv4 session poolers ahead of it; then probe
+// each and use whichever actually connects.
+function dbCandidates(raw) {
+  const list = [raw];
+  try {
+    const u = new URL(raw);
+    const m = u.hostname.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
+    if (m) {
+      const ref = m[1];
+      for (const region of ['aws-1', 'aws-0']) {
+        const c = new URL(raw);
+        c.username = 'postgres.' + ref;
+        c.hostname = region + '-eu-central-1.pooler.supabase.com';
+        list.unshift(c.toString());
+      }
+    }
+  } catch (e) { /* keep original */ }
+  return list;
+}
+
+let pool = null;
+let activeDbUrl = null;
+async function connectDb() {
+  if (!pg || !process.env.DATABASE_URL) return false;
+  for (const cand of dbCandidates(process.env.DATABASE_URL)) {
+    const c = new pg.Client({ connectionString: cand, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 10000 });
+    try {
+      await c.connect();
+      await c.end();
+      activeDbUrl = cand;
+      pool = new pg.Pool({ connectionString: cand, ssl: { rejectUnauthorized: false } });
+      dbBroken = false;
+      lastDbError = null;
+      console.log('DB connected via:', new URL(cand).hostname);
+      return true;
+    } catch (e) {
+      try { await c.end(); } catch (_) {}
+      console.log('DB candidate failed:', new URL(cand).hostname, '-', e.code || e.message);
+      lastDbError = e.message;
+    }
+  }
+  dbBroken = true;
+  pool = null;
+  console.log('DB unreachable on all candidates; memory mode');
+  return false;
+}
 const memoryKeys = new Map(); // key -> { email, created_at }
 
 async function initDb() {
+  if (!pg || !process.env.DATABASE_URL) return;
+  await connectDb();
   if (!pool) return;
   await pool.query(`
     CREATE TABLE IF NOT EXISTS developers (
@@ -185,7 +234,8 @@ async function incrUsage(key) {
 
 // diagnostic: shows whether the DB connection is healthy
 app.get('/v1/db-check', async (req, res) => {
-  const out = { db_configured: !!pool, last_error: lastDbError ? String(lastDbError).slice(0, 300) : null, live: null };
+  if (!pool) await connectDb(); // self-heal: re-probe candidates if connection was lost at boot
+  const out = { db_configured: !!pool, active_host: activeDbUrl ? new URL(activeDbUrl).hostname : null, last_error: lastDbError ? String(lastDbError).slice(0, 300) : null, live: null };
   if (pool) {
     try {
       const r = await pool.query('SELECT 1 AS ok');

@@ -52,6 +52,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Prompt Presets</td><td><code>/v1/presets</code></td><td>Versioned style + scene presets for consistent generations</td></tr>
 <tr><td>Text &rarr; Video</td><td><code>POST /v1/video/render</code></td><td>Scene-based MP4, Shorts or widescreen, narration voice per scene, auto-subtitles, webhook callback when done</td></tr>
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
+<tr><td>Real Motion Video</td><td><code>POST /v1/video/image-to-video</code></td><td>True AI footage where subjects move — Kling / Hailuo / Wan via your Replicate or fal.ai key. Styles: <code>GET /v1/video/styles</code></td></tr>
 <tr><td>Multi-step Workflows</td><td><code>POST /v1/workflows</code></td><td>Chain steps (image &rarr; speech &rarr; animate); later steps reuse earlier outputs via <code>{{s1.url}}</code></td></tr>
 <tr><td>Portfolio Service</td><td><code>/v1/portfolios</code></td><td>Artist portfolios with AI-generated or uploaded artworks; publish to a shareable gallery</td></tr>
 <tr><td>Game Logic Service</td><td><code>/v1/games</code></td><td>Branching narrative projects: scenes, player choices, AI scene art, story maps</td></tr>
@@ -479,7 +480,7 @@ app.delete('/v1/presets/:ref', async (req, res) => {
 app.get('/v1/openapi.json', (req, res) => {
   res.json({
     openapi: '3.0.3',
-    info: { title: 'Studio API', version: '1.7.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
+    info: { title: 'Studio API', version: '1.8.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
     servers: [{ url: 'https://studio-api-nqpm.onrender.com' }],
     components: {
       securitySchemes: { ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' } },
@@ -494,6 +495,8 @@ app.get('/v1/openapi.json', (req, res) => {
       '/v1/db-check': { get: { summary: 'Database connection diagnostic', responses: { '200': { description: 'ok' } } } },
       '/v1/image/generate': { post: { summary: 'Generate an image from text (or a preset)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { prompt: { type: 'string' }, preset: { type: 'string', description: 'preset name or id; combined with prompt if both given' }, width: { type: 'integer' }, height: { type: 'integer' }, model: { type: 'string' }, seed: { type: 'integer' } } } } } }, responses: { '200': { description: 'image URL' } } } },
       '/v1/video/render': { post: { summary: 'Render a scene-based MP4 (narration, subtitles, webhook)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { title: { type: 'string' }, subtitles: { type: 'boolean' }, webhook: { type: 'string', description: 'https URL called when the render finishes or fails' }, scenes: { type: 'array', items: { '$ref': '#/components/schemas/Scene' } } } } } } }, responses: { '200': { description: 'job_id; poll /v1/video/status/:id' } } } },
+      '/v1/video/image-to-video': { post: { summary: 'Real image-to-video: animate a still into true motion footage (needs provider token)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['image_url'], properties: { image_url: { type: 'string' }, style: { type: 'string', description: 'one of the keys from /v1/video/styles' }, prompt: { type: 'string' }, motion: { type: 'string' }, duration: { type: 'number', minimum: 2, maximum: 10 }, model: { type: 'string', enum: ['kling', 'hailuo', 'wan'] }, provider: { type: 'string', enum: ['replicate', 'fal'] }, webhook: { type: 'string' } } } } } }, responses: { '202': { description: 'job accepted, poll status_url' }, '503': { description: 'provider token not configured' } } } },
+      '/v1/video/styles': { get: { summary: 'Available image-to-video styles and configured providers', responses: { '200': { description: 'ok' } } } },
       '/v1/video/status/{id}': { get: { summary: 'Render job status', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'status' } } } },
       '/v1/video/file/{id}': { get: { summary: 'Download finished MP4', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'video bytes' } } } },
       '/v1/video/thumbnail/{id}': { get: { summary: 'Branded cover image from a finished video', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'at', in: 'query', schema: { type: 'number' }, description: 'frame time in seconds' }, { name: 'text', in: 'query', schema: { type: 'string' }, description: 'title overlay' }], responses: { '200': { description: 'jpeg bytes' } } } },
@@ -541,7 +544,7 @@ app.post('/v1/developers/signup', async (req, res) => {
 });
 
 // ---------- auth middleware ----------
-const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios', '/v1/games', '/v1/classes'];
+const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/video/image-to-video', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios', '/v1/games', '/v1/classes'];
 
 app.use('/v1', async (req, res, next) => {
   const key = req.headers['x-api-key'];
@@ -842,6 +845,198 @@ function fireWebhook(job) {
   fetch(job.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
     .catch(e => console.error('webhook delivery failed:', e.message));
 }
+
+// ---------- Phase E: real image-to-video (true motion footage) ----------
+// Unlike /v1/video/from-image (Ken Burns pans over stills), these models
+// generate REAL motion: characters walk, cloth moves, smoke drifts.
+// Requires REPLICATE_API_TOKEN or FAL_KEY (set in Render dashboard env).
+// Premium provider costs are paid on YOUR provider account, not metered here
+// beyond the normal 1-op free-tier metering.
+
+const I2V_STYLES = {
+  dark_fantasy_african: { label: 'African dark fantasy epic (Maker-of-Zulu style)', suffix: 'epic African dark fantasy movie scene, godly scale, dramatic moody lighting, drifting smoke and embers, deep shadows, ultra detailed, cinematic', negative: 'cartoon, anime, flat lighting, text, watermark' },
+  cinematic_epic: { label: 'Photoreal cinematic epic', suffix: 'photorealistic cinematic film shot, shot on 70mm, shallow depth of field, dramatic lighting, subtle camera drift, film grain', negative: 'cartoon, anime, illustration, text, watermark' },
+  anime: { label: 'Anime', suffix: 'anime film scene, hand-drawn cinematic animation, expressive motion, vivid colors, studio quality', negative: 'photorealistic, live action, text, watermark' },
+  ghanaian_folktale: { label: 'Ghanaian folktale', suffix: 'West African village folktale scene, warm firelight, kente patterns, dust motes, gentle mystical atmosphere, cinematic', negative: 'text, watermark, modern city' },
+  documentary: { label: 'Documentary realism', suffix: 'observational documentary footage, handheld camera, natural light, realistic everyday motion', negative: 'fantasy, stylized, text, watermark' },
+  cartoon_3d: { label: '3D cartoon (Pixar-like)', suffix: 'polished 3D animated movie still brought to life, soft rim lighting, squash-and-stretch motion, vibrant', negative: 'photorealistic, horror, text, watermark' },
+  horror: { label: 'Horror', suffix: 'dark horror movie scene, dread atmosphere, flickering light, slow creeping motion, fog', negative: 'cute, bright, cheerful, text, watermark' },
+  action: { label: 'Action blockbuster', suffix: 'high-energy action movie shot, dynamic camera move, motion blur, explosive atmosphere', negative: 'static, slow, dull, text, watermark' },
+  nature: { label: 'Nature / wildlife', suffix: 'breathtaking wildlife documentary shot, golden hour, animals moving naturally, 4K nature film', negative: 'text, watermark, cartoon' },
+  dreamlike: { label: 'Dreamlike / spiritual', suffix: 'ethereal dreamlike scene, floating particles, soft glow, slow graceful motion, otherworldly', negative: 'harsh, gritty, text, watermark' }
+};
+
+// Model registry: tried in order until one accepts the job (some model ids
+// change over time; 404/410/422 on one falls through to the next).
+const I2V_MODELS = [
+  { key: 'kling', provider: 'replicate', model: 'kwaivgi/kling-v2.5-master', build: (image, prompt, dur) => ({ image, prompt, duration: dur >= 10 ? '10' : '5' }) },
+  { key: 'hailuo', provider: 'replicate', model: 'minimax/hailuo-02', build: (image, prompt, dur) => ({ first_frame_image: image, prompt, duration: dur >= 10 ? '10' : '6' }) },
+  { key: 'wan', provider: 'replicate', model: 'wan-video/wan-2.2-i2i-fast', build: (image, prompt, dur) => ({ image, prompt, duration: dur }) },
+  { key: 'kling', provider: 'fal', model: 'fal-ai/kling-video/v2.5-master/image-to-video', build: (image, prompt, dur) => ({ image_url: image, prompt, duration: dur >= 10 ? '10' : '5' }) },
+  { key: 'hailuo', provider: 'fal', model: 'fal-ai/minimax/hailuo-02/standard/image-to-video', build: (image, prompt, dur) => ({ image_url: image, prompt }) },
+  { key: 'wan', provider: 'fal', model: 'fal-ai/wan-i2i', build: (image, prompt, dur) => ({ image_url: image, prompt }) }
+];
+const I2V_DEFAULT_ORDER = process.env.I2V_MODEL ? [process.env.I2V_MODEL] : ['kling', 'hailuo', 'wan'];
+
+function i2vProviderKey(provider) {
+  return provider === 'fal' ? process.env.FAL_KEY : process.env.REPLICATE_API_TOKEN;
+}
+
+async function replicateStart(entry, input) {
+  const resp = await fetch('https://api.replicate.com/v1/models/' + entry.model + '/predictions', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + process.env.REPLICATE_API_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input })
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) { const e = new Error('replicate start failed ' + resp.status + ': ' + (body.detail || body.error || '')); e.status = resp.status; throw e; }
+  return body;
+}
+
+async function replicatePoll(pred) {
+  const r = await fetch(pred.urls.get, { headers: { Authorization: 'Bearer ' + process.env.REPLICATE_API_TOKEN } });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error('replicate poll failed ' + r.status); e.status = r.status; throw e; }
+  return body;
+}
+
+async function falStart(entry, input) {
+  const resp = await fetch('https://queue.fal.run/' + entry.model, {
+    method: 'POST',
+    headers: { Authorization: 'Key ' + process.env.FAL_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(input)
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) { const e = new Error('fal start failed ' + resp.status + ': ' + (body.detail || body.error || '')); e.status = resp.status; throw e; }
+  return body;
+}
+
+async function falResult(q) {
+  // poll queue status then fetch response
+  for (let i = 0; i < 140; i++) {
+    const r = await fetch(q.status_url, { headers: { Authorization: 'Key ' + process.env.FAL_KEY } });
+    const st = await r.json().catch(() => ({}));
+    if (st.status === 'COMPLETED') break;
+    if (st.status === 'FAILED') throw new Error('fal job failed');
+    await new Promise(rs => setTimeout(rs, 5000));
+  }
+  const r2 = await fetch(q.response_url, { headers: { Authorization: 'Key ' + process.env.FAL_KEY } });
+  return r2.json();
+}
+
+function extractVideoUrl(output) {
+  if (!output) return null;
+  if (typeof output === 'string' && /^https?:\/\//.test(output)) return output;
+  if (Array.isArray(output)) { for (const o of output) { const u = extractVideoUrl(o); if (u) return u; } return null; }
+  if (typeof output === 'object') return extractVideoUrl(output.url || output.video || (output.output && output.output.url));
+  return null;
+}
+
+async function downloadVideoToDisk(url, dest) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('video download failed: ' + resp.status);
+  const ws = fs.createWriteStream(dest);
+  const reader = resp.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      ws.write(Buffer.from(value));
+    }
+  } finally { ws.end(); }
+  await new Promise((res, rej) => { ws.on('finish', res); ws.on('error', rej); });
+}
+
+app.get('/v1/video/styles', (req, res) => {
+  const styles = {};
+  for (const [k, v] of Object.entries(I2V_STYLES)) styles[k] = v.label;
+  res.json({ styles, models: I2V_DEFAULT_ORDER, custom_prompt: 'pass any style as free text in `prompt`', providers: { replicate: !!process.env.REPLICATE_API_TOKEN, fal: !!process.env.FAL_KEY } });
+});
+
+app.post('/v1/video/image-to-video', async (req, res) => {
+  const b = req.body || {};
+  const imageUrl = b.image_url || b.image;
+  if (!imageUrl || !/^https:\/\//.test(String(imageUrl))) return res.status(400).json({ error: 'https image_url is required' });
+  const duration = Math.min(Math.max(parseFloat(b.duration) || 5, 2), 10);
+  const styleKey = b.style ? String(b.style) : (b.preset ? String(b.preset) : null);
+  let style = null;
+  if (styleKey) {
+    if (!I2V_STYLES[styleKey]) return res.status(400).json({ error: 'unknown style: ' + styleKey, available: Object.keys(I2V_STYLES) });
+    style = I2V_STYLES[styleKey];
+  }
+  const userPrompt = (typeof b.prompt === 'string') ? b.prompt.trim() : '';
+  if (!styleKey && !userPrompt) return res.status(400).json({ error: 'style or prompt is required', available_styles: Object.keys(I2V_STYLES) });
+  let motion = (typeof b.motion === 'string') ? b.motion.trim() : ''; // optional camera/subject direction
+  let prompt = userPrompt;
+  if (style) prompt = prompt ? prompt + ', ' + style.suffix : style.suffix;
+  if (motion) prompt += '. ' + motion;
+
+  const providers = [];
+  if (process.env.REPLICATE_API_TOKEN) providers.push('replicate');
+  if (process.env.FAL_KEY) providers.push('fal');
+  if (!providers.length) return res.status(503).json({
+    error: 'Image-to-video is not configured yet. Add REPLICATE_API_TOKEN (replicate.com/account/api-tokens) or FAL_KEY (fal.ai) as an environment variable in your Render dashboard, then redeploy.',
+    how_to: ['Render Dashboard -> studio-api -> Environment -> Add Environment Variable REPLICATE_API_TOKEN', 'Manual Deploy -> Deploy latest commit', 'Provider credit is pre-paid on your replicate/fal.ai account (roughly $0.03-0.30 per second of video)']
+  });
+
+  // model preference: b.model (key), b.provider, then default order filtered to configured providers
+  let candidates = I2V_MODELS.filter(m => providers.includes(m.provider));
+  if (b.model || b.provider) {
+    const want = String(b.model || '').toLowerCase();
+    const pref = String(b.provider || '').toLowerCase();
+    candidates = I2V_MODELS.filter(m =>
+      (!pref || m.provider === pref) && (!want || m.key === want) && providers.includes(m.provider));
+    if (!candidates.length) return res.status(400).json({ error: 'no configured model matches model/provider', configured_providers: providers });
+  }
+  if (!candidates.length) return res.status(503).json({ error: 'no image-to-video model available for configured providers', configured_providers: providers });
+
+  const jobId = crypto.randomUUID();
+  const hook = (req.body && /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(req.body.webhook || ''))) ? String(req.body.webhook) : null;
+  jobs.set(jobId, { status: 'queued', progress: 10, error: null, videoId: null, createdAt: Date.now(), webhook: hook, baseUrl: 'https://' + req.get('host'), i2v: true });
+  (async () => {
+    const jobDir = path.join(VIDEOS_DIR, jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    const job = jobs.get(jobId);
+    try {
+      let videoUrl = null, usedModel = null, lastErr = null;
+      for (const entry of candidates) {
+        try {
+          job.progress = 30; job.status = 'processing';
+          if (entry.provider === 'replicate') {
+            const pred = await replicateStart(entry, entry.build(imageUrl, prompt, duration));
+            for (let i = 0; i < 150; i++) {
+              const st = await replicatePoll(pred);
+              if (st.status === 'succeeded') { videoUrl = extractVideoUrl(st.output); break; }
+              if (st.status === 'failed' || st.status === 'canceled') throw new Error('prediction failed: ' + (st.error || 'unknown'));
+              job.progress = Math.min(90, 30 + Math.round(60 * (i / 100)));
+              await new Promise(rs => setTimeout(rs, 5000));
+            }
+          } else {
+            const q = await falStart(entry, entry.build(imageUrl, prompt, duration));
+            const result = await falResult(q);
+            videoUrl = extractVideoUrl(result);
+          }
+          if (!videoUrl) throw new Error('provider returned no video URL');
+          usedModel = entry.provider + ':' + entry.model;
+          break;
+        } catch (e) {
+          lastErr = e;
+          console.error('i2v attempt failed (' + entry.provider + '/' + entry.model + '):', e.message);
+          const retryable = ![401, 402, 403].includes(e.status); // auth/billing errors won't fix by switching model
+          if (!retryable) break;
+        }
+      }
+      if (!videoUrl) throw new Error(lastErr ? lastErr.message : 'all models failed');
+      job.progress = 95;
+      await downloadVideoToDisk(videoUrl, path.join(jobDir, 'output.mp4'));
+      job.status = 'done'; job.progress = 100; job.videoId = jobId; job.model = usedModel;
+    } catch (e) {
+      job.status = 'failed'; job.error = e.message;
+    }
+    fireWebhook(jobs.get(jobId));
+  })();
+  res.status(202).json({ job_id: jobId, style: styleKey, prompt, duration, models_tried: candidates.map(c => c.provider + ':' + c.model), status_url: '/v1/video/status/' + jobId, video_url: '/v1/video/file/' + jobId });
+});
 
 // ---------- text -> pdf (lesson sheets with Arabic + grammar) ----------
 app.post('/v1/pdf/generate', async (req, res) => {

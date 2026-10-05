@@ -55,6 +55,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Multi-step Workflows</td><td><code>POST /v1/workflows</code></td><td>Chain steps (image &rarr; speech &rarr; animate); later steps reuse earlier outputs via <code>{{s1.url}}</code></td></tr>
 <tr><td>Portfolio Service</td><td><code>/v1/portfolios</code></td><td>Artist portfolios with AI-generated or uploaded artworks; publish to a shareable gallery</td></tr>
 <tr><td>Game Logic Service</td><td><code>/v1/games</code></td><td>Branching narrative projects: scenes, player choices, AI scene art, story maps</td></tr>
+<tr><td>Madrasa Classroom</td><td><code>/v1/classes</code></td><td>Teacher dashboards for the Huruuf game: classes, student rosters, per-letter progress reports</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">MANAGE RENDERS</h3>
 <table>
@@ -66,6 +67,8 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>GET</td><td><code>/v1/workflows/:id/files/:name</code></td><td>Download step output files</td></tr>
 <tr><td>GET</td><td><code>/gallery/:id</code></td><td>Public portfolio gallery (no key needed, published portfolios)</td></tr>
 <tr><td>GET</td><td><code>/v1/games/:id/story-map</code></td><td>Branching map with unresolved targets &amp; unreachable scenes</td></tr>
+<tr><td>GET</td><td><code>/v1/classes/:id/report</code></td><td>Per-student accuracy, mastered and weak letters</td></tr>
+<tr><td>POST</td><td><code>/v1/join</code></td><td>Student joins a class from the Huruuf game (class code + name)</td></tr>
 </table>
 <h3 style="color:#C9A96A;margin:22px 0 6px">ACCOUNT</h3>
 <table>
@@ -266,6 +269,35 @@ async function initDb() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS madrasa_classes (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      code TEXT UNIQUE,
+      teacher TEXT,
+      created_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madrasa_students (
+      id TEXT PRIMARY KEY,
+      class_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madrasa_progress (
+      id TEXT PRIMARY KEY,
+      student_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      letter TEXT NOT NULL,
+      correct BOOLEAN,
+      created_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS workflows (
       id TEXT PRIMARY KEY,
       key TEXT NOT NULL,
@@ -447,7 +479,7 @@ app.delete('/v1/presets/:ref', async (req, res) => {
 app.get('/v1/openapi.json', (req, res) => {
   res.json({
     openapi: '3.0.3',
-    info: { title: 'Studio API', version: '1.6.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
+    info: { title: 'Studio API', version: '1.7.0', description: 'AI media engine: images, videos with narration and subtitles, speech, lesson PDFs, prompt presets, multi-step workflows. Companion to the Ilm API. Auth: x-api-key header on every /v1 request. Free tier: metered endpoints count toward a monthly limit.' },
     servers: [{ url: 'https://studio-api-nqpm.onrender.com' }],
     components: {
       securitySchemes: { ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' } },
@@ -482,6 +514,13 @@ app.get('/v1/openapi.json', (req, res) => {
       '/v1/games/{id}/scenes/{sid}': { patch: { summary: 'Update scene narrative/choices', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete scene', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
       '/v1/games/{id}/scenes/{sid}/assets': { post: { summary: 'Generate scene art (prompt defaults from the scene narrative; metered)', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'art generated' } } } },
       '/v1/games/{id}/story-map': { get: { summary: 'Branch graph: nodes, edges, unresolved targets, unreachable scenes', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
+      '/v1/classes': { post: { summary: 'Create a madrasa class (returns a 6-char join code)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['name'], properties: { name: { type: 'string' }, teacher: { type: 'string' } } } } } }, responses: { '201': { description: 'created' } } }, get: { summary: 'List your classes with student counts', responses: { '200': { description: 'ok' } } } },
+      '/v1/classes/{id}': { get: { summary: 'Class with student roster', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, patch: { summary: 'Update class', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } }, delete: { summary: 'Delete class, roster and progress', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
+      '/v1/classes/{id}/students': { post: { summary: 'Add a student', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '201': { description: 'created' } } } },
+      '/v1/classes/{id}/students/{sid}': { delete: { summary: 'Remove a student and their progress', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'deleted' } } } },
+      '/v1/join': { post: { summary: 'Student joins a class by code + name (same name rejoins same student)', responses: { '200': { description: 'joined' } } } },
+      '/v1/students/{sid}/progress': { post: { summary: 'Log one quiz answer (letter, correct) - free, never metered', parameters: [{ name: 'sid', in: 'path', required: true, schema: { type: 'string' } }], responses: { '201': { description: 'logged' } } } },
+      '/v1/classes/{id}/report': { get: { summary: 'Class report: per-student accuracy, mastered/weak letters, per-letter detail', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
       '/v1/workflows/{id}': { get: { summary: 'Workflow status with per-step results', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'ok' } } } },
       '/v1/workflows/{id}/files/{name}': { get: { summary: 'Download a step output file', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, { name: 'name', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'file bytes' } } } },
     },
@@ -502,7 +541,7 @@ app.post('/v1/developers/signup', async (req, res) => {
 });
 
 // ---------- auth middleware ----------
-const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios', '/v1/games'];
+const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios', '/v1/games', '/v1/classes'];
 
 app.use('/v1', async (req, res, next) => {
   const key = req.headers['x-api-key'];
@@ -1611,6 +1650,264 @@ app.get('/v1/games/:id/story-map', async (req, res) => {
   if (g.start_scene) walk(g.start_scene);
   const unreachable = scenes.filter(s => !reachable.has(s.id)).map(s => ({ id: s.id, title: s.title }));
   res.json({ game_id: g.id, start_scene: g.start_scene, nodes, edges, unresolved_targets: unresolved, unreachable_scenes: unreachable });
+});
+
+// ---------- madrasa classroom service (Phase D) ----------
+// Teacher dashboards for the Huruuf game: classes, students, and
+// per-letter progress. Teachers own their class; students join with
+// a class code and every quiz answer is logged. Reports power the
+// parent WhatsApp progress cards.
+const memClasses = new Map();  // id -> class
+const memStudents = new Map(); // id -> student
+const memProgress = [];       // {id, student_id, key, letter, correct, ts}
+
+function mdCode() {
+  const abc = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no confusables (I,L,O,0,1)
+  let c = '';
+  for (let i = 0; i < 6; i++) c += abc[Math.random() * abc.length | 0];
+  return c;
+}
+
+async function mdSaveClass(c) {
+  memClasses.set(c.id, c);
+  if (!pool || dbBroken) return;
+  try {
+    await pool.query(
+      'INSERT INTO madrasa_classes (id, key, name, code, teacher, created_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=$3, teacher=$5',
+      [c.id, c.key, c.name, c.code, c.teacher || null, c.created_at]
+    );
+  } catch (e) { console.error('class persist failed:', e.message); }
+}
+
+async function mdClassById(id) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM madrasa_classes WHERE id = $1', [id]);
+      if (r.rowCount) return r.rows[0];
+    } catch (e) { console.error('class get failed:', e.message); }
+  }
+  return memClasses.get(id) || null;
+}
+
+async function mdClassByCode(code) {
+  const up = String(code || '').trim().toUpperCase();
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM madrasa_classes WHERE code = $1', [up]);
+      if (r.rowCount) return r.rows[0];
+    } catch (e) { console.error('code lookup failed:', e.message); }
+  }
+  return [...memClasses.values()].find(c => c.code === up) || null;
+}
+
+async function mdClassesFor(key) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM madrasa_classes WHERE key = $1 ORDER BY created_at DESC', [key]);
+      if (r.rowCount) return r.rows;
+    } catch (e) { console.error('class list failed:', e.message); }
+  }
+  return [...memClasses.values()].filter(c => c.key === key);
+}
+
+async function mdDeleteClass(id) {
+  memClasses.delete(id);
+  for (const [sid, s] of [...memStudents]) if (s.class_id === id) { memStudents.delete(sid); }
+  for (let i = memProgress.length - 1; i >= 0; i--) { /* keep rows; students gone */ }
+  if (pool && !dbBroken) {
+    try {
+      await pool.query('DELETE FROM madrasa_progress WHERE student_id IN (SELECT id FROM madrasa_students WHERE class_id = $1)', [id]);
+      await pool.query('DELETE FROM madrasa_students WHERE class_id = $1', [id]);
+      await pool.query('DELETE FROM madrasa_classes WHERE id = $1', [id]);
+    } catch (e) { console.error('class delete failed:', e.message); }
+  }
+}
+
+async function mdSaveStudent(s) {
+  memStudents.set(s.id, s);
+  if (!pool || dbBroken) return;
+  try {
+    await pool.query(
+      'INSERT INTO madrasa_students (id, class_id, key, name, created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET name=$4',
+      [s.id, s.class_id, s.key, s.name, s.created_at]
+    );
+  } catch (e) { console.error('student persist failed:', e.message); }
+}
+
+async function mdStudentsOfClass(classId) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM madrasa_students WHERE class_id = $1 ORDER BY name', [classId]);
+      if (r.rowCount) return r.rows;
+    } catch (e) { console.error('student list failed:', e.message); }
+  }
+  return [...memStudents.values()].filter(s => s.class_id === classId).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function mdStudentById(id) {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT * FROM madrasa_students WHERE id = $1', [id]);
+      if (r.rowCount) return r.rows[0];
+    } catch (e) { console.error('student get failed:', e.message); }
+  }
+  return memStudents.get(id) || null;
+}
+
+async function mdDeleteStudent(id) {
+  memStudents.delete(id);
+  if (pool && !dbBroken) {
+    try { await pool.query('DELETE FROM madrasa_progress WHERE student_id = $1', [id]); await pool.query('DELETE FROM madrasa_students WHERE id = $1', [id]); }
+    catch (e) { console.error('student delete failed:', e.message); }
+  }
+}
+
+async function mdLogProgress(studentId, key, letter, correct) {
+  const row = { id: crypto.randomUUID(), student_id: studentId, key, letter, correct, ts: new Date().toISOString() };
+  memProgress.push(row);
+  if (!pool || dbBroken) return row;
+  try {
+    await pool.query('INSERT INTO madrasa_progress (id, student_id, key, letter, correct, created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+      [row.id, row.student_id, row.key, row.letter, row.correct, row.ts]);
+  } catch (e) { console.error('progress persist failed:', e.message); }
+  return row;
+}
+
+async function mdProgressOfStudents(studentIds) {
+  if (!studentIds.length) return [];
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT student_id, letter, correct, created_at FROM madrasa_progress WHERE student_id = ANY($1) ORDER BY created_at', [studentIds]);
+      if (r.rowCount) return r.rows;
+    } catch (e) { console.error('progress read failed:', e.message); }
+  }
+  return memProgress.filter(p => studentIds.includes(p.student_id));
+}
+
+// create a class (teacher)
+app.post('/v1/classes', async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 100);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const now = new Date().toISOString();
+  let c = { id: crypto.randomUUID(), key: req.apiKey, name, code: mdCode(), teacher: String(b.teacher || '').trim().slice(0, 80) || null, created_at: now };
+  // avoid code collisions
+  for (let i = 0; i < 5 && await mdClassByCode(c.code); i++) c.code = mdCode();
+  await mdSaveClass(c);
+  res.status(201).json({ ...c, students_url: '/v1/classes/' + c.id, report_url: '/v1/classes/' + c.id + '/report', join_hint: 'Students enter this code in the Huruuf game: ' + c.code });
+});
+
+app.get('/v1/classes', async (req, res) => {
+  const classes = await mdClassesFor(req.apiKey);
+  const out = [];
+  for (const c of classes) out.push({ ...c, student_count: (await mdStudentsOfClass(c.id)).length });
+  res.json({ classes: out });
+});
+
+app.get('/v1/classes/:id', async (req, res) => {
+  const c = await mdClassById(req.params.id);
+  if (!c || c.key !== req.apiKey) return res.status(404).json({ error: 'class not found' });
+  res.json({ ...c, students: await mdStudentsOfClass(c.id) });
+});
+
+app.patch('/v1/classes/:id', async (req, res) => {
+  const c = await mdClassById(req.params.id);
+  if (!c || c.key !== req.apiKey) return res.status(404).json({ error: 'class not found' });
+  const b = req.body || {};
+  if (b.name !== undefined) c.name = String(b.name).trim().slice(0, 100) || c.name;
+  if (b.teacher !== undefined) c.teacher = String(b.teacher).trim().slice(0, 80) || null;
+  await mdSaveClass(c);
+  res.json(c);
+});
+
+app.delete('/v1/classes/:id', async (req, res) => {
+  const c = await mdClassById(req.params.id);
+  if (!c || c.key !== req.apiKey) return res.status(404).json({ error: 'class not found' });
+  await mdDeleteClass(c.id);
+  res.json({ deleted: true, id: c.id });
+});
+
+// add a student (teacher)
+app.post('/v1/classes/:id/students', async (req, res) => {
+  const c = await mdClassById(req.params.id);
+  if (!c || c.key !== req.apiKey) return res.status(404).json({ error: 'class not found' });
+  const name = String((req.body || {}).name || '').trim().slice(0, 60);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const s = { id: crypto.randomUUID(), class_id: c.id, key: req.apiKey, name, created_at: new Date().toISOString() };
+  await mdSaveStudent(s);
+  res.status(201).json(s);
+});
+
+app.delete('/v1/classes/:id/students/:sid', async (req, res) => {
+  const c = await mdClassById(req.params.id);
+  if (!c || c.key !== req.apiKey) return res.status(404).json({ error: 'class not found' });
+  const s = await mdStudentById(req.params.sid);
+  if (!s || s.class_id !== c.id) return res.status(404).json({ error: 'student not found' });
+  await mdDeleteStudent(s.id);
+  res.json({ deleted: true, id: s.id });
+});
+
+// student joins from the Huruuf game with the class code + their name.
+// re-joining with the same name returns the same student (case-insensitive).
+app.post('/v1/join', async (req, res) => {
+  const b = req.body || {};
+  const c = await mdClassByCode(b.code);
+  if (!c) return res.status(404).json({ error: 'class code not found — ask your teacher' });
+  const name = String(b.name || '').trim().slice(0, 60);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const students = await mdStudentsOfClass(c.id);
+  let s = students.find(x => x.name.toLowerCase() === name.toLowerCase());
+  if (!s) {
+    s = { id: crypto.randomUUID(), class_id: c.id, key: req.apiKey, name, created_at: new Date().toISOString() };
+    await mdSaveStudent(s);
+  }
+  res.json({ student_id: s.id, student_name: s.name, class_id: c.id, class_name: c.name, teacher: c.teacher });
+});
+
+// log one quiz answer (student browser, high volume — never metered)
+app.post('/v1/students/:sid/progress', async (req, res) => {
+  const s = await mdStudentById(req.params.sid);
+  if (!s) return res.status(404).json({ error: 'student not found — rejoin with your class code' });
+  const b = req.body || {};
+  const letter = String(b.letter || '').trim().slice(0, 4);
+  if (!letter) return res.status(400).json({ error: 'letter is required' });
+  const correct = !!b.correct;
+  const row = await mdLogProgress(s.id, req.apiKey, letter, correct);
+  res.status(201).json({ logged: true, student_id: s.id, letter, correct, ts: row.ts });
+});
+
+// teacher report: per-student and per-letter stats for the whole class
+app.get('/v1/classes/:id/report', async (req, res) => {
+  const c = await mdClassById(req.params.id);
+  if (!c || c.key !== req.apiKey) return res.status(404).json({ error: 'class not found' });
+  const students = await mdStudentsOfClass(c.id);
+  const progress = await mdProgressOfStudents(students.map(s => s.id));
+  const byStudent = new Map(students.map(s => [s.id, { c: 0, w: 0, letters: new Map(), last: null }]));
+  for (const p of progress) {
+    const st = byStudent.get(p.student_id);
+    if (!st) continue;
+    if (p.correct) st.c++; else st.w++;
+    const L = st.letters.get(p.letter) || { c: 0, w: 0 };
+    if (p.correct) L.c++; else L.w++;
+    st.letters.set(p.letter, L);
+    st.last = p.created_at || p.ts;
+  }
+  const report = students.map(s => {
+    const st = byStudent.get(s.id);
+    const attempts = st.c + st.w;
+    const accuracy = attempts ? Math.round(st.c * 100 / attempts) : null;
+    const letters = {};
+    let mastered = 0, weak = [];
+    for (const [ch, L] of st.letters) {
+      const a = L.c + L.w, acc = Math.round(L.c * 100 / a);
+      letters[ch] = { attempts: a, correct: L.c, wrong: L.w, accuracy: acc };
+      if (a >= 2 && acc >= 75) mastered++;
+      else if (a >= 2 && acc < 50) weak.push(ch);
+    }
+    return { id: s.id, name: s.name, attempts, correct: st.c, wrong: st.w, accuracy, mastered, weak_letters: weak.slice(0, 5), letters, last_active: st.last };
+  });
+  const totals = report.reduce((t, r) => ({ attempts: t.attempts + r.attempts, correct: t.correct + r.correct }), { attempts: 0, correct: 0 });
+  res.json({ class: { id: c.id, name: c.name, code: c.code, teacher: c.teacher }, student_count: students.length, totals: { ...totals, accuracy: totals.attempts ? Math.round(totals.correct * 100 / totals.attempts) : null }, students: report });
 });
 
 // ---------- start ----------

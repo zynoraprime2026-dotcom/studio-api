@@ -4,7 +4,7 @@ FROM node:20-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg fonts-dejavu-core python3 python3-pip
 RUN apt-get clean
-RUN pip3 install --no-cache-dir --break-system-packages edge-tts reportlab arabic-reshaper python-bidi || pip3 install --no-cache-dir edge-tts reportlab arabic-reshaper python-bidi
+RUN pip3 install --no-cache-dir --break-system-packages "edge-tts>=7.3.1" reportlab arabic-reshaper python-bidi || pip3 install --no-cache-dir "edge-tts>=7.3.1" reportlab arabic-reshaper python-bidi
 
 WORKDIR /app
 COPY package.json ./

@@ -338,6 +338,22 @@ async function initDb() {
       params JSONB DEFAULT '{}',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    ` + `
+    CREATE TABLE IF NOT EXISTS movies (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT,
+      aspect_ratio TEXT,
+      language TEXT,
+      style TEXT,
+      narrator_voice TEXT,
+      duration DOUBLE PRECISION,
+      scenes JSONB DEFAULT '[]',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 }
 
@@ -2272,6 +2288,600 @@ app.post('/v1/masjid/answer', async (req, res) => {
   if (!answer) return res.status(502).json({ error: 'Answer generation failed: ' + groqErr });
 
   res.json({ answer, sources: { prayerTimes, announcementsUsed: anns.map(a => ({ id: a.id, text: a.text, created_at: a.created_at })) } });
+});
+
+// ---------- AI Movie orchestrator (Phase F) ----------
+// POST /v1/movie/create — one pipeline that chains the API's own capabilities:
+//   1. Script  — Groq LLM splits the story into scenes (or accepts caller scenes)
+//   2. Images  — Pollinations, one still per scene, shared seed for consistency
+//   3. Animate — real image-to-video (Replicate/fal) per scene, Ken Burns fallback
+//   4. Narrate — edge-tts narration per scene
+//   5. Subs    — WebVTT timed to actual narration lengths
+//   6. Assemble— ffmpeg: scene clips + narration + soft subtitles -> one MP4
+// Heavy pipeline: counts as MOVIE_USAGE_COST uses against the monthly limit and
+// is rate-limited to MOVIE_DAILY_LIMIT creates per key per day. Movies are
+// owned by the key that created them; only that key can fetch them.
+// New endpoints only — existing endpoints are untouched.
+
+const MOVIE_USAGE_COST = parseInt(process.env.MOVIE_USAGE_COST) || 20;
+const MOVIE_DAILY_LIMIT = parseInt(process.env.MOVIE_DAILY_LIMIT) || 3;
+const MOVIE_MAX_SCENES = parseInt(process.env.MOVIE_MAX_SCENES) || 12;
+const MOVIE_DIR = path.join(WORK_DIR, 'movies'); // WORK_DIR=/data on Render (persistent disk)
+fs.mkdirSync(MOVIE_DIR, { recursive: true });
+
+const memoryMovies = new Map(); // id -> movie (mirror; primary store when DB is unreachable)
+const movieDayRate = new Map(); // key -> { day, count } (memory fallback for the daily limit)
+
+// bulk usage increment for heavy endpoints (the auth middleware charges 1 per
+// METERED route; /v1/movie/create is not METERED — the whole cost is charged here,
+// only after validation and rate checks pass)
+async function addUsage(key, n) {
+  const month = currentMonth();
+  if (pool && !dbBroken) {
+    try {
+      await pool.query('INSERT INTO api_usage (key, month, count) VALUES ($1, $2, $3) ON CONFLICT (key, month) DO UPDATE SET count = api_usage.count + $3', [key, month, n]);
+      return;
+    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('usage bulk incr failed, falling back to memory:', e.message); }
+  }
+  const u = memoryUsage.get(key);
+  const base = u && u.month === month ? u.count : 0;
+  memoryUsage.set(key, { month, count: base + n });
+}
+
+// daily create limit: 3 movies per key per day (counts DB rows when available)
+function movieToday() { return new Date().toISOString().slice(0, 10); }
+async function movieDailyUsed(key) {
+  const day = movieToday();
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT COUNT(*)::int AS n FROM movies WHERE key = $1 AND created_at >= $2', [key, day + 'T00:00:00Z']);
+      return { day, count: r.rows[0].n };
+    } catch (e) { lastDbError = e.message; console.error('movie daily count failed:', e.message); }
+  }
+  const mr = movieDayRate.get(key);
+  return { day, count: mr && mr.day === day ? mr.count : 0 };
+}
+function movieDailyIncr(key) {
+  const day = movieToday();
+  const mr = movieDayRate.get(key);
+  movieDayRate.set(key, mr && mr.day === day ? { day, count: mr.count + 1 } : { day, count: 1 });
+}
+
+// persistent storage: DB row (same resilient pattern as portfolios/workflows) + memory mirror
+async function mvSave(m) {
+  memoryMovies.set(m.id, m);
+  if (pool && !dbBroken) {
+    try {
+      await pool.query(
+        `INSERT INTO movies (id, key, title, status, error, aspect_ratio, language, style, narrator_voice, duration, scenes, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+         ON CONFLICT (id) DO UPDATE SET status=$4, error=$5, duration=$10, scenes=$11, updated_at=NOW()`,
+        [m.id, m.key, m.title, m.status, m.error || null, m.aspect, m.language, m.style || null,
+         m.narratorVoice || null, m.duration || null, JSON.stringify(m.scenes || []), m.createdAt]);
+      return;
+    } catch (e) { lastDbError = e.message; console.error('movie save failed:', e.message); }
+  }
+}
+
+async function mvGetDb(id) {
+  if (!pool || dbBroken) return null;
+  try {
+    const r = await pool.query('SELECT * FROM movies WHERE id = $1', [id]);
+    if (!r.rowCount) return null;
+    const row = r.rows[0];
+    return {
+      id: row.id, key: row.key, title: row.title, status: row.status, error: row.error,
+      aspect: row.aspect_ratio, language: row.language, style: row.style,
+      narratorVoice: row.narrator_voice, duration: row.duration, scenes: row.scenes || [],
+      createdAt: row.created_at, restored: true
+    };
+  } catch (e) { console.error('movie db read failed:', e.message); }
+  return null;
+}
+
+// owner check: movie must exist AND belong to the calling key; uniform 404 otherwise
+async function mvOwn(id, key) {
+  const m = memoryMovies.get(id) || await mvGetDb(id);
+  if (!m || m.key !== key) return null;
+  return m;
+}
+
+// generic retry-once helper (each pipeline step retries once on failure)
+async function retryOnce(fn, waitMs) {
+  try { return await fn(); } catch (e) {
+    await new Promise(r => setTimeout(r, waitMs || 2000));
+    return await fn();
+  }
+}
+
+// ---------- content guard: respectful Islamic content standard ----------
+// Never depict prophets, companions of the Prophet, angels, God, or other sacred
+// figures. Matched prompts are replaced with silhouette visuals (and calligraphy
+// is the preset alternative) so the pipeline keeps running without depicting them.
+const SACRED_FIGURE_RE = /\b(prophets?|muhammad|mohammed|mohamed|mahomet|rasul|rasool|messenger\s+of\s+(?:allah|god)|nabi|isa|jesus|christ|musa|moses|ibrahim|abraham|nuh|noah|yusuf|joseph|yunus|jonah|dawud|david|sulaiman|solomon|maryam|mary|sahaba|sahabah|companions?\s+of\s+the\s+prophet|companions|abu\s+bakr|umar|uthman|ali|aisha|fatimah?|khadijah?|bilal|hamza|hasan|hussein|husayn|jibril|gabriel|malaikah?|angels?|god(?:s|dess)?|deity|divine\s+(?:figure|being))\b/gi;
+
+function contentGuard(prompt) {
+  const hits = String(prompt).match(SACRED_FIGURE_RE);
+  if (!hits) return { prompt: String(prompt), applied: false };
+  const cleaned = String(prompt).replace(SACRED_FIGURE_RE, 'distant silhouetted figures, faces obscured, backlit');
+  return { prompt: cleaned + ', respectful depiction, no faces of sacred figures', applied: true, replaced: [...new Set(hits.map(h => h.toLowerCase()))] };
+}
+
+// ---------- step 1: script (Groq LLM, same client as the Masjid service) ----------
+async function groqMovieScenes(story, style, language, maxScenes) {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new Error('GROQ_API_KEY is not configured on the server (needed when scenes are not provided)');
+  const target = Math.min(Math.max(4, Math.ceil(story.length / 400)), maxScenes);
+  const sys =
+    'You are a film director and script writer. Split the given story into about ' + target + ' cinematic scenes (never more than ' + maxScenes + '). ' +
+    'Reply with ONLY a JSON object of the form {"scenes":[{"id":"s1","visualPrompt":"...","narrationText":"..."}]}. ' +
+    'visualPrompt: one sentence describing the action, PLUS a consistent visual description of the main characters (appearance, clothing) and the setting that is repeated in every scene so all scenes look consistent. ' +
+    'NEVER depict prophets, companions of the Prophet, angels, God, or any sacred religious figures — describe such characters only as distant silhouettes with faces obscured, or replace them with calligraphy or landscape visuals. ' +
+    'narrationText: 1-2 sentences of film narration written in ' + language + '.';
+  const messages = [{ role: 'system', content: sys }, { role: 'user', content: 'Story: ' + story + (style ? '\nOverall visual style: ' + style : '') }];
+  let parsed = null, lastErr = null;
+  // attempt 1: JSON mode; attempt 2 (fallback): plain completion (in case JSON mode is rejected)
+  for (const useJson of [true, false]) {
+    try {
+      const body = { model: GROQ_MODEL, messages, temperature: 0.6, max_tokens: 2500 };
+      if (useJson) body.response_format = { type: 'json_object' };
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'StudioAPI/1.0' },
+        body: JSON.stringify(body)
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((d.error && d.error.message) || 'Groq request failed');
+      const txt = d.choices[0].message.content;
+      try { parsed = JSON.parse(txt); } catch (e) {
+        const m = txt.match(/\{[\s\S]*\}/);
+        if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) {} }
+      }
+      if (parsed && Array.isArray(parsed.scenes) && parsed.scenes.length) return parsed;
+      throw new Error('script JSON could not be parsed');
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error(lastErr ? lastErr.message : 'script generation failed');
+}
+
+function normalizeScriptScenes(raw) {
+  return (Array.isArray(raw) ? raw : []).slice(0, MOVIE_MAX_SCENES).map((s, i) => ({
+    id: String((s && (s.id || s.ID)) || ('s' + (i + 1))).slice(0, 12),
+    visualPrompt: String((s && (s.visualPrompt || s.visual_prompt || s.prompt)) || '').trim().slice(0, 600),
+    narrationText: String((s && (s.narrationText || s.narration_text || s.narration || s.text)) || '').trim().slice(0, 600),
+    imageUrl: (s && s.image && /^https:\/\//.test(String(s.image))) ? String(s.image) : null
+  })).filter(s => s.visualPrompt || s.narrationText || s.imageUrl);
+}
+
+// ---------- step 2: scene images (Pollinations, shared seed for consistency) ----------
+async function mvFetchImage(url, dest) {
+  const attempt = async () => {
+    const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 StudioAPI/1.0' } });
+    if (!resp.ok) {
+      const e = new Error('image fetch failed: ' + resp.status);
+      e.status = resp.status;
+      if (resp.status === 402 || resp.status === 429) {
+        // Pollinations rate-limit body: "Retry after 11s" — honor it (fallback 5s)
+        let ms = 5000;
+        try {
+          const body = await resp.clone().json();
+          const m = String((body.error && body.error.message) || body.message || '').match(/retry after (\d+)s/i);
+          if (m) ms = (parseInt(m[1]) + 1) * 1000;
+        } catch (e2) {}
+        e.waitMs = Math.min(ms, 60000);
+      }
+      throw e;
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length) throw new Error('image fetch returned an empty body');
+    fs.writeFileSync(dest, buf);
+  };
+  let tries = 0;
+  for (;;) {
+    try { return await attempt(); } catch (e) {
+      tries++;
+      const rateLimited = e.status === 402 || e.status === 429;
+      const serverError = e.status >= 500;
+      // rate limit: up to 4 tries honoring the provider's retry-after;
+      // transient 5xx: 3 tries 5s apart; other failures: retry once
+      const maxTries = rateLimited ? 4 : (serverError ? 3 : 2);
+      if (tries >= maxTries) throw e;
+      const wait = e.waitMs || (rateLimited ? 5000 : (serverError ? 5000 : 2000));
+      console.log('movie image fetch failed (' + e.status + '), retry ' + tries + '/' + (maxTries - 1) + ' in ' + Math.round(wait / 1000) + 's: ' + e.message);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+}
+
+// ---------- step 3: animate (real i2v with the same model registry; Ken Burns fallback) ----------
+function movieI2VProviders() {
+  const p = [];
+  if (process.env.REPLICATE_API_TOKEN) p.push('replicate');
+  if (process.env.FAL_KEY) p.push('fal');
+  return p;
+}
+
+async function movieI2VClip(imageUrl, prompt, duration, onTick) {
+  const providers = movieI2VProviders();
+  let candidates = I2V_MODELS.filter(m => providers.includes(m.provider));
+  if (I2V_DEFAULT_ORDER.length === 1) {
+    const pref = I2V_DEFAULT_ORDER[0];
+    candidates.sort((a, b) => (a.key === pref ? -1 : 0) - (b.key === pref ? -1 : 0));
+  }
+  let videoUrl = null, usedModel = null, lastErr = null;
+  for (const entry of candidates) {
+    try {
+      if (entry.provider === 'replicate') {
+        const pred = await replicateStart(entry, entry.build(imageUrl, prompt, duration));
+        for (let i = 0; i < 150; i++) {
+          const st = await replicatePoll(pred);
+          if (st.status === 'succeeded') { videoUrl = extractVideoUrl(st.output); break; }
+          if (st.status === 'failed' || st.status === 'canceled') throw new Error('prediction failed: ' + (st.error || 'unknown'));
+          if (onTick) onTick();
+          await new Promise(rs => setTimeout(rs, 5000));
+        }
+      } else {
+        const q = await falStart(entry, entry.build(imageUrl, prompt, duration));
+        const result = await falResult(q);
+        videoUrl = extractVideoUrl(result);
+      }
+      if (!videoUrl) throw new Error('provider returned no video URL');
+      usedModel = entry.provider + ':' + entry.model;
+      break;
+    } catch (e) {
+      lastErr = e;
+      console.error('movie i2v attempt failed (' + entry.provider + '/' + entry.model + '):', e.message);
+      if ([401, 402, 403].includes(e.status)) break; // auth/billing errors won't fix by switching model
+    }
+  }
+  if (!videoUrl) throw new Error(lastErr ? lastErr.message : 'all i2v models failed');
+  return { videoUrl, model: usedModel };
+}
+
+async function movieKenBurns(imgPath, outPath, duration, W, H) {
+  const FPS = 30;
+  const N = Math.round(duration * FPS);
+  const z = 'min(1+' + (0.22 / N).toFixed(6) + '*in,1.22)';
+  const vf = [
+    'scale=' + Math.round(W * 1.3) + ':' + Math.round(H * 1.3) + ':force_original_aspect_ratio=increase',
+    'crop=' + Math.round(W * 1.3) + ':' + Math.round(H * 1.3),
+    "zoompan=z='" + z + "':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=" + W + 'x' + H + ':fps=' + FPS,
+    'format=yuv420p'
+  ];
+  await execFileAsync('ffmpeg', ['-y', '-threads', '1', '-filter_threads', '1', '-loop', '1', '-framerate', String(FPS),
+    '-t', String(duration), '-i', imgPath, '-vf', vf.join(','), '-r', String(FPS),
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-pix_fmt', 'yuv420p', outPath],
+    { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+}
+
+// ---------- step 5: subtitles (WebVTT timed to narration length) ----------
+function vttTimestamp(s) {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60), ms = Math.round((s - Math.floor(s)) * 1000);
+  const p = (n, w) => String(n).padStart(w || 2, '0');
+  return p(h) + ':' + p(m) + ':' + p(sec) + '.' + p(ms, 3);
+}
+function buildVtt(cues) {
+  return 'WEBVTT\n\n' + cues.map((c, i) =>
+    (i + 1) + '\n' + vttTimestamp(c.start) + ' --> ' + vttTimestamp(c.end) + '\n' + String(c.text).replace(/\r?\n/g, ' ')
+  ).join('\n\n') + '\n';
+}
+
+function movieLangCode(language) {
+  const l = String(language || '').toLowerCase();
+  if (/arab|^ar\b/.test(l)) return 'ar';
+  if (/fran|french|^fr\b/.test(l)) return 'fr';
+  return 'en';
+}
+function movieDefaultVoice(language) {
+  return movieLangCode(language) === 'ar' ? 'ar-SA-HamedNeural' : 'en-US-GuyNeural';
+}
+
+// ---------- the pipeline ----------
+async function runMoviePipeline(movie, opts) {
+  const dir = path.join(MOVIE_DIR, movie.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const W = opts.W, H = opts.H;
+  const movieSeed = parseInt(movie.id.slice(4, 12), 16) % 1000000; // same seed every scene -> visual consistency
+  try {
+    movie.status = 'scripting';
+    movie.progress = 3;
+    await mvSave(movie);
+
+    // 1. script
+    let rawScenes;
+    if (opts.providedScenes) rawScenes = opts.providedScenes;
+    else rawScenes = await retryOnce(() => groqMovieScenes(opts.story, opts.style, opts.language, MOVIE_MAX_SCENES), 3000);
+    const scenes = normalizeScriptScenes(rawScenes);
+    if (!scenes.length) throw new Error('script produced no usable scenes');
+    for (const sc of scenes) {
+      if (sc.visualPrompt) {
+        const g = contentGuard(sc.visualPrompt);
+        sc.visualPrompt = g.prompt;
+        sc.contentGuard = g.applied ? { applied: true, replaced: g.replaced } : undefined;
+      }
+    }
+    // storyboard is visible right away; per-scene outputs are filled in as they finish
+    movie.scenes = scenes.map(sc => ({ id: sc.id, visualPrompt: sc.visualPrompt || null, narration: sc.narrationText || null, contentGuard: sc.contentGuard || null, imageUrl: null, clipUrl: null, narrationUrl: null, clipSource: null, duration: null, narrationError: null }));
+    movie.status = 'processing';
+    movie.progress = 6;
+    await mvSave(movie);
+
+    // 2-4. per scene: image -> animate -> narration (sequential, retry each step once)
+    const per = 74 / scenes.length; // progress 6 -> 80
+    for (let i = 0; i < scenes.length; i++) {
+      const sc = scenes[i];
+      const out = movie.scenes[i]; // storyboard object created above, enriched per step
+      const assetBase = movie.baseUrl + '/v1/movie/' + movie.id + '/scenes/' + i + '/';
+
+      // image
+      let imageUrl = sc.imageUrl;
+      if (!imageUrl) {
+        const fullPrompt = [sc.visualPrompt, opts.style, 'cinematic film still, consistent characters and setting across all scenes'].filter(Boolean).join(', ');
+        const params = new URLSearchParams({ width: String(W), height: String(H), nologo: 'true', seed: String(movieSeed) });
+        imageUrl = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(fullPrompt) + '?' + params;
+      }
+      const imgPath = path.join(dir, 'scene' + i + '.jpg');
+      await mvFetchImage(imageUrl, imgPath);
+      out.imageUrl = assetBase + 'image';
+      out.imageSourceUrl = imageUrl;
+      movie.progress = Math.round(6 + per * (i + 0.4));
+      await mvSave(movie);
+
+      // animate (real motion; Ken Burns fallback so the movie still completes)
+      const clipPath = path.join(dir, 'clip' + i + '.mp4');
+      const animPrompt = [sc.visualPrompt, opts.style].filter(Boolean).join(', ') || 'slow cinematic camera drift, subtle motion';
+      if (movieI2VProviders().length) {
+        try {
+          const r = await retryOnce(() => movieI2VClip(out.imageSourceUrl || imageUrl, animPrompt, 5), 3000);
+          await downloadVideoToDisk(r.videoUrl, clipPath);
+          out.clipSource = r.model;
+        } catch (e) {
+          console.error('movie scene ' + i + ' i2v failed, using Ken Burns fallback:', e.message);
+        }
+      }
+      if (!out.clipSource) {
+        await retryOnce(() => movieKenBurns(imgPath, clipPath, 5, W, H), 2000);
+        out.clipSource = 'ken_burns';
+      }
+      out.clipUrl = assetBase + 'clip';
+      movie.progress = Math.round(6 + per * (i + 0.8));
+      await mvSave(movie);
+
+      // narration
+      if (sc.narrationText) {
+        const narrPath = path.join(dir, 'narr' + i + '.mp3');
+        try {
+          await retryOnce(() => speakText(sc.narrationText, movie.narratorVoice, opts.rate, narrPath), 2000);
+          out.narrationUrl = assetBase + 'narration';
+        } catch (e) {
+          out.narrationError = 'narration failed: ' + e.message; // scene continues silently
+        }
+      }
+      movie.progress = Math.round(6 + per * (i + 1));
+      await mvSave(movie);
+    }
+
+    // 5. subtitles: time each cue to the actual narration/audio length
+    movie.progress = 82;
+    await mvSave(movie);
+    const cues = [];
+    let cursor = 0;
+    for (let i = 0; i < movie.scenes.length; i++) {
+      const sc = movie.scenes[i];
+      const clipPath = path.join(dir, 'clip' + i + '.mp4');
+      const narrPath = path.join(dir, 'narr' + i + '.mp3');
+      const clipDur = await mediaDuration(clipPath);
+      const narrDur = fs.existsSync(narrPath) ? await mediaDuration(narrPath) : 0;
+      const segDur = Math.max(clipDur, narrDur) + (narrDur ? 0.3 : 0); // small beat after narration
+      sc.duration = Math.round(segDur * 100) / 100;
+      if (sc.narration) cues.push({ start: cursor, end: cursor + segDur, text: sc.narration });
+      cursor += segDur;
+    }
+    const vttPath = path.join(dir, 'subtitles.vtt');
+    fs.writeFileSync(vttPath, buildVtt(cues));
+
+    // 6. assemble: per-scene segment (clip + narration, video padded to audio),
+    //    concat, then mux subtitles as a soft mov_text track
+    movie.status = 'assembling';
+    await mvSave(movie);
+    const segFiles = [];
+    for (let i = 0; i < movie.scenes.length; i++) {
+      const sc = movie.scenes[i];
+      const clipPath = path.join(dir, 'clip' + i + '.mp4');
+      const narrPath = path.join(dir, 'narr' + i + '.mp3');
+      const hasNarr = fs.existsSync(narrPath);
+      const clipDur = await mediaDuration(clipPath);
+      const narrDur = hasNarr ? await mediaDuration(narrPath) : 0;
+      const segDur = Math.max(clipDur, narrDur) + (hasNarr ? 0.3 : 0);
+      const padDur = Math.max(0, segDur - clipDur);
+      const args = ['-y', '-i', clipPath];
+      if (hasNarr) args.push('-i', narrPath); else args.push('-f', 'lavfi', '-t', segDur.toFixed(3), '-i', 'anullsrc=r=44100:cl=mono');
+      const fc = '[0:v]tpad=stop_mode=clone:stop_duration=' + padDur.toFixed(3) +
+        ',scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,crop=' + W + ':' + H + ',format=yuv420p[v]' +
+        (hasNarr ? ';[1:a]apad[a]' : '');
+      args.push('-filter_complex', fc, '-map', '[v]', '-map', hasNarr ? '[a]' : '1:a',
+        '-t', segDur.toFixed(3), '-r', '30', '-threads', '1', '-filter_threads', '1',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', path.join(dir, 'seg' + i + '.mp4'));
+      await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+      segFiles.push(path.join(dir, 'seg' + i + '.mp4'));
+      movie.progress = Math.round(82 + 13 * ((i + 1) / movie.scenes.length)); // 82 -> 95
+      await mvSave(movie);
+    }
+    const listPath = path.join(dir, 'list.txt');
+    fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\''") + "'").join('\n'));
+    const concatPath = path.join(dir, 'concat.mp4');
+    await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+    const finalPath = path.join(dir, 'final.mp4');
+    try {
+      await execFileAsync('ffmpeg', ['-y', '-i', concatPath, '-i', vttPath, '-map', '0', '-map', '1',
+        '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=' + movieLangCode(movie.language), finalPath],
+        { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
+    } catch (e) {
+      // subtitle mux is optional: ship the movie without a soft subtitle track, VTT still served
+      console.error('movie subtitle mux failed, shipping without embedded subs:', e.message);
+      fs.copyFileSync(concatPath, finalPath);
+      movie.subtitleNote = 'subtitles available at /v1/movie/' + movie.id + '/subtitles (embedding failed: ' + e.message + ')';
+    }
+    for (const f of segFiles) { try { fs.unlinkSync(f); } catch (e) {} }
+    try { fs.unlinkSync(concatPath); fs.unlinkSync(listPath); } catch (e) {}
+    movie.duration = Math.round((await mediaDuration(finalPath)) * 100) / 100;
+    movie.status = 'done';
+    movie.progress = 100;
+    movie.error = null;
+    await mvSave(movie);
+    fireMovieWebhook(movie);
+  } catch (e) {
+    // assembly/pipeline failure: per-scene assets are preserved and still fetchable
+    movie.status = movie.scenes && movie.scenes.length && movie.scenes.some(s => s.clipUrl) ? 'partial' : 'failed';
+    movie.error = e.message;
+    await mvSave(movie);
+    fireMovieWebhook(movie);
+  }
+}
+
+function fireMovieWebhook(movie) {
+  if (!movie.webhook) return;
+  fetch(movie.webhook, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      event: movie.status === 'done' ? 'movie.completed' : 'movie.failed',
+      movie_id: movie.id, status: movie.status, error: movie.error || null,
+      videoUrl: movie.status === 'done' ? movie.baseUrl + '/v1/movie/' + movie.id + '/file' : null,
+      duration: movie.duration || null, scenes: movie.scenes || []
+    })
+  }).catch(e => console.error('movie webhook failed:', e.message));
+}
+
+// ---------- endpoints ----------
+app.post('/v1/movie/create', async (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 160);
+  const story = String(b.story || '').trim().slice(0, 4000);
+  const providedScenes = Array.isArray(b.scenes) && b.scenes.length ? b.scenes : null;
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  if (!story && !providedScenes) return res.status(400).json({ error: 'story or scenes is required' });
+  if (providedScenes && providedScenes.length > MOVIE_MAX_SCENES) return res.status(400).json({ error: 'too many scenes (max ' + MOVIE_MAX_SCENES + ')' });
+
+  const language = String(b.language || 'English').trim().slice(0, 40);
+  const style = String(b.style || '').trim().slice(0, 300);
+  const rate = /^-?\d+%$/.test(String(b.narrationRate || '')) ? String(b.narrationRate) : '+0%';
+  const ar = String(b.aspectRatio || b.aspect || '9:16').toLowerCase();
+  const aspect = (ar === '16:9' || ar === 'wide' || ar === 'landscape' || ar === 'widescreen') ? '16:9' : '9:16';
+  const W = aspect === '16:9' ? 1280 : 1080;
+  const H = aspect === '16:9' ? 720 : 1920;
+  const narratorVoice = VOICE_RE.test(String(b.narratorVoice || '')) ? String(b.narratorVoice) : movieDefaultVoice(language);
+  const hook = /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(b.webhook || '')) ? String(b.webhook) : null;
+
+  // daily rate limit: 3 movie creates per key per day
+  const daily = await movieDailyUsed(req.apiKey);
+  if (daily.count >= MOVIE_DAILY_LIMIT) {
+    return res.status(429).json({ error: 'Rate limit: ' + MOVIE_DAILY_LIMIT + ' movie creations per key per day. Try again tomorrow.', used_today: daily.count, limit: MOVIE_DAILY_LIMIT });
+  }
+
+  // heavy pipeline: the whole call counts as 20 uses against the monthly limit
+  const { month, used } = await getUsage(req.apiKey);
+  if (used + MOVIE_USAGE_COST > FREE_MONTHLY_LIMIT) {
+    return res.status(429).json({ error: 'Free monthly limit too low for a movie render (needs ' + MOVIE_USAGE_COST + ' uses). Email support to upgrade.', month, limit: FREE_MONTHLY_LIMIT, used, needed: MOVIE_USAGE_COST });
+  }
+  await addUsage(req.apiKey, MOVIE_USAGE_COST);
+  res.setHeader('X-Usage-Limit', FREE_MONTHLY_LIMIT);
+  res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - MOVIE_USAGE_COST));
+
+  const id = 'mov_' + crypto.randomUUID();
+  const movie = {
+    id, key: req.apiKey, title, status: 'queued', progress: 0, error: null,
+    aspect, language, style, narratorVoice, duration: null, scenes: [],
+    createdAt: new Date().toISOString(),
+    webhook: hook, baseUrl: 'https://' + req.get('host')
+  };
+  await mvSave(movie);
+  movieDailyIncr(req.apiKey);
+  runMoviePipeline(movie, { story, providedScenes, language, style, rate, W, H }).catch(e => console.error('movie pipeline crashed:', e.message));
+  res.status(202).json({
+    movie_id: id, status: 'queued',
+    poll: '/v1/movie/' + id, status_url: '/v1/movie/' + id,
+    video_url: '/v1/movie/' + id + '/file', subtitles_url: '/v1/movie/' + id + '/subtitles',
+    scene_count_planned: providedScenes ? providedScenes.length : null,
+    cost: MOVIE_USAGE_COST + ' uses', daily_limit: MOVIE_DAILY_LIMIT, webhook: !!hook
+  });
+});
+
+app.get('/v1/movie/list', async (req, res) => {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT id, title, status, aspect_ratio, duration, created_at FROM movies WHERE key = $1 ORDER BY created_at DESC LIMIT 50', [req.apiKey]);
+      return res.json({ movies: r.rows.map(x => ({ id: x.id, title: x.title, status: x.status, aspectRatio: x.aspect_ratio, duration: x.duration, created_at: x.created_at })) });
+    } catch (e) { console.error('movie list db failed:', e.message); }
+  }
+  const mine = [...memoryMovies.values()].filter(m => m.key === req.apiKey).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)).slice(0, 50);
+  res.json({ movies: mine.map(m => ({ id: m.id, title: m.title, status: m.status, aspectRatio: m.aspect, duration: m.duration, created_at: m.createdAt })) });
+});
+
+app.get('/v1/movie/:id', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const done = m.status === 'done';
+  const partial = m.status === 'partial';
+  res.json({
+    id: m.id, title: m.title, status: m.status, progress: m.progress !== undefined ? m.progress : (done ? 100 : null),
+    error: m.error || null,
+    videoUrl: (done || partial) && (m.status === 'done') ? '/v1/movie/' + m.id + '/file' : null,
+    subtitlesUrl: '/v1/movie/' + m.id + '/subtitles',
+    duration: m.duration || null,
+    language: m.language, style: m.style, aspectRatio: m.aspect, narratorVoice: m.narratorVoice,
+    scenes: (m.scenes || []).map(s => ({
+      id: s.id, imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration,
+      narrationUrl: s.narrationUrl, visualPrompt: s.visualPrompt, contentGuard: s.contentGuard || null,
+      clipSource: s.clipSource, duration: s.duration, narrationError: s.narrationError || null
+    })),
+    subtitleNote: m.subtitleNote || null,
+    created_at: m.createdAt,
+    note: m.restored ? 'state restored from database (service restarted)' : undefined
+  });
+});
+
+function movieFilePath(m, name) {
+  if (!/^[\w.-]+$/.test(name)) return null;
+  const p = path.join(MOVIE_DIR, m.id, name);
+  if (!fs.existsSync(p)) return null;
+  return p;
+}
+
+app.get('/v1/movie/:id/file', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  if (m.status !== 'done') return res.status(404).json({ error: 'movie not ready (status: ' + m.status + ')' });
+  const p = movieFilePath(m, 'final.mp4');
+  if (!p) return res.status(404).json({ error: 'movie file missing (disk may have been recycled — rebuild from scene assets)' });
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + m.title.replace(/[^\w.-]+/g, '_').slice(0, 60) + '.mp4"');
+  fs.createReadStream(p).pipe(res);
+});
+
+app.get('/v1/movie/:id/subtitles', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const p = movieFilePath(m, 'subtitles.vtt');
+  if (!p) return res.status(404).json({ error: 'subtitles not ready or not found' });
+  res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+  fs.createReadStream(p).pipe(res);
+});
+
+app.get('/v1/movie/:id/scenes/:idx/:asset', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const idx = parseInt(req.params.idx);
+  if (!(idx >= 0) || idx >= (m.scenes || []).length) return res.status(404).json({ error: 'scene not found' });
+  const asset = String(req.params.asset);
+  const map = { image: { file: 'scene' + idx + '.jpg', type: 'image/jpeg' }, clip: { file: 'clip' + idx + '.mp4', type: 'video/mp4' }, narration: { file: 'narr' + idx + '.mp3', type: 'audio/mpeg' } };
+  const spec = map[asset];
+  if (!spec) return res.status(400).json({ error: 'asset must be image, clip, or narration' });
+  const p = movieFilePath(m, spec.file);
+  if (!p) return res.status(404).json({ error: spec.file + ' not found' });
+  res.setHeader('Content-Type', spec.type);
+  res.setHeader('Content-Disposition', 'attachment; filename="movie-' + m.id.slice(4, 12) + '-scene' + idx + '-' + asset + '.' + spec.file.split('.').pop() + '"');
+  fs.createReadStream(p).pipe(res);
 });
 
 // ---------- start ----------

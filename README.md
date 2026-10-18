@@ -41,3 +41,68 @@ All /v1 routes (except signup) need header: `x-api-key: <key>`
 - Image generation uses Pollinations (free, no API key, no cost)
 - Videos are stored in `/data` (container disk). On free Render tier, disk is ephemeral — download videos promptly or wire Supabase Storage later.
 - Developer keys match the Ilm API signup pattern, but keys are per-service (studio_... vs ilm_...)
+
+## AI Movie orchestrator
+
+`POST /v1/movie/create` chains the API's own capabilities into one pipeline:
+script (Groq LLM) → scene images (Pollinations) → animation (real image-to-video
+via Replicate/fal, with a Ken Burns fallback) → narration (edge-tts) → subtitles
+(WebVTT, timed to narration) → ffmpeg assembly into one MP4 with a soft
+subtitle track.
+
+```json
+{
+  "title": "The Scribe of Timbuktu",
+  "story": "A scribe protects ancient manuscripts...",
+  "style": "warm golden hour, cinematic",
+  "scenes": null,
+  "narratorVoice": "en-US-GuyNeural",
+  "language": "English",
+  "aspectRatio": "9:16",
+  "webhook": "https://example.com/movie-done"
+}
+```
+
+| Field | Notes |
+|---|---|
+| `title` | required |
+| `story` | required unless `scenes` is given; auto-split into scenes by the LLM |
+| `scenes` | optional array of `{id?, visualPrompt?, narrationText?, image?}` — skips the script step |
+| `style` | global visual style appended to every scene prompt |
+| `narratorVoice` | edge-tts voice id (e.g. `ar-SA-HamedNeural`); derived from `language` if omitted |
+| `language` | narration language for the LLM (and subtitle track tag) |
+| `aspectRatio` | `9:16` (default, Shorts) or `16:9` |
+| `webhook` | optional; POSTs `movie.completed` / `movie.failed` with the final payload |
+
+Responses: `202 {movie_id, status_url, ...}` — poll `GET /v1/movie/:id` until
+`status: "done"`, then `GET /v1/movie/:id/file`. When done the poll returns
+`{videoUrl, duration, scenes:[{id, imageUrl, clipUrl, narration, narrationUrl,
+visualPrompt, clipSource, duration, contentGuard}]}`.
+
+Other routes: `GET /v1/movie/list`, `GET /v1/movie/:id/subtitles` (WebVTT),
+`GET /v1/movie/:id/scenes/:idx/{image|clip|narration}` (per-scene assets,
+preserved even if assembly fails — status becomes `partial` with the error).
+
+Rules:
+
+- `x-api-key` required (401 otherwise); movies are owned by the creating key,
+  other keys get a uniform 404
+- the call counts as **20 uses** against the monthly free limit
+- **3 movie creations per key per day** (429 over)
+- scenes process in sequence; each step retries on failure (Pollinations
+  rate-limit retry-after is honored, up to 4 tries)
+- content guard: prompts depicting prophets, companions, angels, God or other
+  sacred figures are refused and replaced with silhouette visuals
+- if ffmpeg assembly fails, per-scene assets are kept and returned with the error
+
+New optional env vars: `MOVIE_USAGE_COST` (default 20), `MOVIE_DAILY_LIMIT`
+(default 3), `MOVIE_MAX_SCENES` (default 12). Reuses existing `GROQ_API_KEY`
+(script step; not needed when `scenes` is supplied) and `REPLICATE_API_TOKEN` /
+`FAL_KEY` (true-motion clips; without them the pipeline falls back to Ken Burns
+motion rendered locally with ffmpeg).
+
+Render notes: ffmpeg is already in the Docker image. Mount a **persistent disk
+at `/data`** (the `WORK_DIR`) so finished movies and scene assets survive
+deploys and restarts. Subtitles are muxed as a soft `mov_text` track (no libass
+needed); the same subtitles are downloadable as WebVTT. Assembly uses
+memory-lean encode flags and is safe on the free 512MB tier.

@@ -244,6 +244,25 @@ async function initDb() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS masjid_mosques (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      mosque_name TEXT NOT NULL,
+      city TEXT NOT NULL,
+      whatsapp_admin_phone TEXT,
+      created_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS masjid_announcements (
+      id TEXT PRIMARY KEY,
+      mosque_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS game_projects (
       id TEXT PRIMARY KEY,
       key TEXT NOT NULL,
@@ -492,6 +511,9 @@ app.get('/v1/openapi.json', (req, res) => {
     paths: {
       '/v1/developers/signup': { post: { summary: 'Create an API key', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['email'], properties: { email: { type: 'string' } } } } } }, responses: { '200': { description: 'key created' } } } },
       '/v1/usage': { get: { summary: 'Monthly usage and limit', responses: { '200': { description: 'ok' } } } },
+      '/v1/masjid/register': { post: { summary: 'Register a mosque (returns mosqueId; owned by your API key)', responses: { '201': { description: 'created' }, '400': { description: 'mosqueName and city required' } } } },
+      '/v1/masjid/announce': { post: { summary: "Store a mosque announcement (Jumu'ah times, programs, fundraisers) — owner key only", responses: { '201': { description: 'stored' }, '404': { description: 'mosque not found (or not yours)' } } } },
+      '/v1/masjid/answer': { post: { summary: 'Answer a member question using Ilm API prayer times + stored announcements + LLM. Costs 2 monthly uses, max 20/hour per key', responses: { '200': { description: 'ok' }, '404': { description: 'mosque not found (or not yours)' }, '429': { description: 'rate or monthly limit' } } } },
       '/v1/db-check': { get: { summary: 'Database connection diagnostic', responses: { '200': { description: 'ok' } } } },
       '/v1/image/generate': { post: { summary: 'Generate an image from text (or a preset)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { prompt: { type: 'string' }, preset: { type: 'string', description: 'preset name or id; combined with prompt if both given' }, width: { type: 'integer' }, height: { type: 'integer' }, model: { type: 'string' }, seed: { type: 'integer' } } } } } }, responses: { '200': { description: 'image URL' } } } },
       '/v1/video/render': { post: { summary: 'Render a scene-based MP4 (narration, subtitles, webhook)', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { title: { type: 'string' }, subtitles: { type: 'boolean' }, webhook: { type: 'string', description: 'https URL called when the render finishes or fails' }, scenes: { type: 'array', items: { '$ref': '#/components/schemas/Scene' } } } } } } }, responses: { '200': { description: 'job_id; poll /v1/video/status/:id' } } } },
@@ -544,7 +566,7 @@ app.post('/v1/developers/signup', async (req, res) => {
 });
 
 // ---------- auth middleware ----------
-const METERED = ['/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/video/image-to-video', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios', '/v1/games', '/v1/classes'];
+const METERED = ['/v1/masjid/answer', '/v1/image/generate', '/v1/video/render', '/v1/video/from-image', '/v1/video/image-to-video', '/v1/audio/speak', '/v1/content/generate', '/v1/pdf/generate', '/v1/workflows', '/v1/portfolios', '/v1/games', '/v1/classes'];
 
 app.use('/v1', async (req, res, next) => {
   const key = req.headers['x-api-key'];
@@ -2103,6 +2125,153 @@ app.get('/v1/classes/:id/report', async (req, res) => {
   });
   const totals = report.reduce((t, r) => ({ attempts: t.attempts + r.attempts, correct: t.correct + r.correct }), { attempts: 0, correct: 0 });
   res.json({ class: { id: c.id, name: c.name, code: c.code, teacher: c.teacher }, student_count: students.length, totals: { ...totals, accuracy: totals.attempts ? Math.round(totals.correct * 100 / totals.attempts) : null }, students: report });
+});
+
+
+// ---------- Masjid Answer service ----------
+// Multi-developer: every mosque is owned by the x-api-key that registered it.
+// Isolation: a key can only see/touch mosques it created (foreign keys get 404, not 403,
+// so the very existence of another developer's mosque is never revealed).
+
+const memoryMosques = new Map();        // id -> mosque (used when DB is unreachable)
+const memoryAnnouncements = [];         // {id, mosque_id, key, text, created_at}
+
+async function mSave(mosque) {
+  if (pool && !dbBroken) {
+    try { await pool.query('INSERT INTO masjid_mosques (id, key, mosque_name, city, whatsapp_admin_phone, created_at) VALUES ($1,$2,$3,$4,$5,$6)', [mosque.id, mosque.key, mosque.mosqueName, mosque.city, mosque.whatsappAdminPhone || null, mosque.created_at]); return; }
+    catch (e) { lastDbError = e.message; console.error('mosque save failed:', e.message); }
+  }
+  memoryMosques.set(mosque.id, mosque);
+}
+
+async function mGet(id) {
+  if (pool && !dbBroken) {
+    try { const r = await pool.query('SELECT * FROM masjid_mosques WHERE id = $1', [id]); if (r.rowCount) return r.rows[0]; }
+    catch (e) { lastDbError = e.message; console.error('mosque read failed:', e.message); }
+  }
+  return memoryMosques.get(id) || null;
+}
+
+async function annSave(a) {
+  if (pool && !dbBroken) {
+    try { await pool.query('INSERT INTO masjid_announcements (id, mosque_id, key, text, created_at) VALUES ($1,$2,$3,$4,$5)', [a.id, a.mosque_id, a.key, a.text, a.created_at]); return; }
+    catch (e) { lastDbError = e.message; console.error('announcement save failed:', e.message); }
+  }
+  memoryAnnouncements.push(a);
+}
+
+async function annList(mosqueId) {
+  if (pool && !dbBroken) {
+    try { const r = await pool.query('SELECT id, text, created_at FROM masjid_announcements WHERE mosque_id = $1 ORDER BY created_at DESC LIMIT 10', [mosqueId]); return r.rows; }
+    catch (e) { lastDbError = e.message; console.error('announcement read failed:', e.message); }
+  }
+  return memoryAnnouncements.filter(a => a.mosque_id === mosqueId).slice(-10).reverse().map(a => ({ id: a.id, text: a.text, created_at: a.created_at }));
+}
+
+// owner check: mosque must exist AND belong to the calling key; otherwise uniform 404
+async function ownMosque(id, key) {
+  const m = await mGet(id);
+  if (!m || m.key !== key) return null;
+  return m;
+}
+
+// hourly rate limit for /v1/masjid/answer: 20 per key per hour
+const MASJID_ANSWER_HOURLY = 20;
+const masjidAnswerRate = new Map(); // key -> { hour, count }
+function masjidRate(key) {
+  const hour = new Date().toISOString().slice(0, 13);
+  const r = masjidAnswerRate.get(key);
+  if (!r || r.hour !== hour) { masjidAnswerRate.set(key, { hour, count: 1 }); return { ok: true, count: 1, limit: MASJID_ANSWER_HOURLY }; }
+  r.count += 1;
+  return { ok: r.count <= MASJID_ANSWER_HOURLY, count: r.count, limit: MASJID_ANSWER_HOURLY };
+}
+
+const ILM_API_URL = (process.env.ILM_API_URL || 'https://ilm-api.vercel.app').replace(/\/$/, '');
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const MASJID_SYSTEM_PROMPT = "You are a mosque community assistant. Answer briefly and warmly in simple Ghanaian English. Use only the provided prayer times and announcements as facts. Never issue religious rulings or fatwas — refer fiqh questions to a qualified scholar.";
+
+app.post('/v1/masjid/register', async (req, res) => {
+  const b = req.body || {};
+  const mosqueName = String(b.mosqueName || '').trim().slice(0, 160);
+  const city = String(b.city || '').trim().slice(0, 80);
+  const whatsappAdminPhone = String(b.whatsappAdminPhone || '').trim().slice(0, 32) || null;
+  if (!mosqueName || !city) return res.status(400).json({ error: 'mosqueName and city are required' });
+  const mosque = {
+    id: 'msj_' + crypto.randomUUID(), key: req.apiKey,
+    mosqueName, city, whatsappAdminPhone,
+    created_at: new Date().toISOString(),
+  };
+  await mSave(mosque);
+  res.status(201).json({ mosqueId: mosque.id, mosqueName, city, whatsappAdminPhone, created_at: mosque.created_at, notice: 'Keep this mosqueId. Only this API key can announce or answer for it.' });
+});
+
+app.post('/v1/masjid/announce', async (req, res) => {
+  const b = req.body || {};
+  const mosqueId = String(b.mosqueId || '').trim();
+  const text = String(b.text || '').trim().slice(0, 1000);
+  if (!mosqueId || !text) return res.status(400).json({ error: 'mosqueId and text are required' });
+  const m = await ownMosque(mosqueId, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'mosque not found' });
+  const a = { id: 'ann_' + crypto.randomUUID(), mosque_id: mosqueId, key: req.apiKey, text, created_at: new Date().toISOString() };
+  await annSave(a);
+  res.status(201).json({ announcementId: a.id, mosqueId, text, created_at: a.created_at });
+});
+
+app.post('/v1/masjid/answer', async (req, res) => {
+  const b = req.body || {};
+  const mosqueId = String(b.mosqueId || '').trim();
+  const question = String(b.question || '').trim().slice(0, 1000);
+  if (!mosqueId || !question) return res.status(400).json({ error: 'mosqueId and question are required' });
+  const m = await ownMosque(mosqueId, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'mosque not found' });
+
+  const rate = masjidRate(req.apiKey);
+  if (!rate.ok) return res.status(429).json({ error: 'Rate limit: ' + MASJID_ANSWER_HOURLY + ' answer calls per hour per key. Try again next hour.', used_this_hour: rate.count, limit: rate.limit });
+
+  // this endpoint counts as 2 uses: the auth middleware already added 1 (METERED), add the second here
+  await incrUsage(req.apiKey);
+
+  // a. prayer times from the Ilm API (keyless endpoint; ILM_API_KEY sent when present)
+  let prayerTimes = null;
+  const ilmHeaders = { 'User-Agent': 'StudioAPI/1.0' };
+  if (process.env.ILM_API_KEY) ilmHeaders['x-api-key'] = process.env.ILM_API_KEY;
+  try {
+    const r = await fetch(ILM_API_URL + '/v1/prayer-times?city=' + encodeURIComponent(m.city) + '&method=MuslimWorldLeague', { headers: ilmHeaders });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) prayerTimes = d;
+  } catch (e) { console.error('ilm prayer-times failed:', e.message); }
+
+  // b. this mosque's stored announcements
+  const anns = await annList(mosqueId);
+
+  // c. Groq LLM — note: gpt-oss models reject a top-level "system" param; pass it as a system-role message
+  const key = process.env.GROQ_API_KEY;
+  if (!key) return res.status(503).json({ error: 'Server not configured: GROQ_API_KEY env var missing on the server. Contact the operator.' });
+  const factBlock =
+    'Mosque: ' + m.mosqueName + ', ' + m.city + '\n' +
+    'Prayer times for today (from the Ilm API): ' + JSON.stringify(prayerTimes) + '\n' +
+    'Recent announcements from this mosque (newest first): ' + (anns.length ? anns.map(a => a.text).join(' | ') : 'none yet') + '\n\n' +
+    'Community member question: ' + question;
+  let answer = null, groqErr = null;
+  for (let attempt = 0; attempt < 2 && !answer; attempt++) {
+    try {
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'StudioAPI/1.0' },
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages: [{ role: 'system', content: MASJID_SYSTEM_PROMPT }, { role: 'user', content: factBlock }],
+          temperature: 0.5, max_tokens: 500,
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((d.error && d.error.message) || 'Groq request failed');
+      answer = d.choices[0].message.content;
+    } catch (e) { groqErr = e.message; }
+  }
+  if (!answer) return res.status(502).json({ error: 'Answer generation failed: ' + groqErr });
+
+  res.json({ answer, sources: { prayerTimes, announcementsUsed: anns.map(a => ({ id: a.id, text: a.text, created_at: a.created_at })) } });
 });
 
 // ---------- start ----------

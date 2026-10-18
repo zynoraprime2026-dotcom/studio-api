@@ -2449,7 +2449,7 @@ function normalizeScriptScenes(raw) {
     id: String((s && (s.id || s.ID)) || ('s' + (i + 1))).slice(0, 12),
     visualPrompt: String((s && (s.visualPrompt || s.visual_prompt || s.prompt)) || '').trim().slice(0, 600),
     narrationText: String((s && (s.narrationText || s.narration_text || s.narration || s.text)) || '').trim().slice(0, 600),
-    imageUrl: (s && s.image && /^https:\/\//.test(String(s.image))) ? String(s.image) : null
+    imageUrl: (s && s.image && /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(s.image))) ? String(s.image) : null
   })).filter(s => s.visualPrompt || s.narrationText || s.imageUrl);
 }
 
@@ -2576,6 +2576,151 @@ function movieDefaultVoice(language) {
   return movieLangCode(language) === 'ar' ? 'ar-SA-HamedNeural' : 'en-US-GuyNeural';
 }
 
+// ---------- stage 5-6 (shared by the pipeline and the retry endpoint) ----------
+const MOVIE_CAP_FONT = fs.existsSync('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf') ? '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' : FONT;
+
+function movieSceneFiles(dir, i) {
+  return { clip: path.join(dir, 'clip' + i + '.mp4'), narr: path.join(dir, 'narr' + i + '.mp3'), img: path.join(dir, 'scene' + i + '.jpg') };
+}
+
+// recompute per-scene segment durations from the assets on disk (scene length =
+// max(clip, narration) + small beat); returns the VTT cues
+async function computeSceneDurations(movie, dir, included) {
+  let cursor = 0;
+  const cues = [];
+  for (const i of included) {
+    const sc = movie.scenes[i];
+    const f = movieSceneFiles(dir, i);
+    const clipDur = await mediaDuration(f.clip);
+    const narrDur = fs.existsSync(f.narr) ? await mediaDuration(f.narr) : 0;
+    const segDur = Math.max(clipDur, narrDur) + (narrDur ? 0.3 : 0);
+    sc.duration = Math.round(segDur * 100) / 100;
+    sc.assembled = true;
+    if (sc.narration) cues.push({ start: cursor, end: cursor + segDur, text: sc.narration });
+    cursor += segDur;
+  }
+  return { cues, total: cursor };
+}
+
+// hard-sub captions for players that ignore soft subtitle tracks (e.g. WhatsApp)
+// Note: DejaVu has no Arabic glyphs — use the soft mov_text track + VTT for Arabic.
+function burnedCaptionFilters(text, W) {
+  const size = Math.max(30, Math.round(W / 22));
+  const maxChars = Math.floor((W - 140) / (size * 0.55));
+  const words = String(text).trim().split(/\s+/);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    const t = cur ? cur + ' ' + w : w;
+    if (t.length > maxChars && cur) { lines.push(cur); cur = w; } else cur = t;
+  }
+  if (cur) lines.push(cur);
+  const shown = lines.slice(0, 3).map(l => escDrawtext(l));
+  const out = [];
+  shown.forEach((ln, idx) => {
+    const y = 'h*0.88-' + Math.round((shown.length - 1 - idx) * size * 1.4);
+    out.push('drawtext=fontfile=' + MOVIE_CAP_FONT + ":text='" + ln + "':fontcolor=white:fontsize=" + size + ":x=(w-text_w)/2:y=" + y + ":box=1:boxcolor=black@0.55:boxborderw=14");
+  });
+  return out;
+}
+
+// assemble: optional title card -> per-scene segments (clip + narration, video
+// padded to audio, optional burned captions) -> concat -> optional music bed
+// with narration ducking -> soft mov_text subtitles -> final.mp4
+async function assembleMovie(movie, dir, opts) {
+  const W = opts.W, H = opts.H;
+  const included = [];
+  for (let i = 0; i < movie.scenes.length; i++) if (fs.existsSync(movieSceneFiles(dir, i).clip)) included.push(i);
+  if (!included.length) throw new Error('no scene clips on disk to assemble (assets were not generated for this movie)');
+  for (const sc of movie.scenes) sc.assembled = false;
+  const { cues } = await computeSceneDurations(movie, dir, included);
+  fs.writeFileSync(path.join(dir, 'subtitles.vtt'), buildVtt(cues));
+
+  const totalSegs = included.length + (opts.titleCard ? 1 : 0);
+  const segFiles = [];
+
+  // optional opening title card
+  if (opts.titleCard) {
+    const tPath = path.join(dir, 'title.mp4');
+    const size = Math.max(36, Math.round(W / 14));
+    const vf = "drawtext=fontfile=" + FONT + ":text='" + escDrawtext(movie.title) + "':fontcolor=#F3ECDA:fontsize=" + size +
+      ":x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=#0E2A2B@0.75:boxborderw=40" +
+      ',fade=t=in:st=0:d=0.5,fade=t=out:st=2.0:d=0.5,format=yuv420p';
+    await execFileAsync('ffmpeg', ['-y', '-f', 'lavfi', '-t', '2.5', '-i', 'color=c=0x0E2A2B:s=' + W + 'x' + H + ':r=30',
+      '-f', 'lavfi', '-t', '2.5', '-i', 'anullsrc=r=44100:cl=mono',
+      '-vf', vf, '-r', '30', '-threads', '1', '-filter_threads', '1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-pix_fmt', 'yuv420p', tPath],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
+    segFiles.push(tPath);
+    if (opts.onProgress) opts.onProgress(segFiles.length / totalSegs);
+  }
+
+  for (const i of included) {
+    const sc = movie.scenes[i];
+    const f = movieSceneFiles(dir, i);
+    const hasNarr = fs.existsSync(f.narr);
+    const clipDur = await mediaDuration(f.clip);
+    const padDur = Math.max(0, sc.duration - clipDur);
+    const args = ['-y', '-i', f.clip];
+    if (hasNarr) args.push('-i', f.narr); else args.push('-f', 'lavfi', '-t', sc.duration.toFixed(3), '-i', 'anullsrc=r=44100:cl=mono');
+    let vchain = 'tpad=stop_mode=clone:stop_duration=' + padDur.toFixed(3) +
+      ',scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,crop=' + W + ':' + H;
+    if (opts.burnSubtitles && sc.narration) vchain += ',' + burnedCaptionFilters(sc.narration, W).join(',');
+    vchain += ',format=yuv420p';
+    const fc = '[0:v]' + vchain + '[v]' + (hasNarr ? ';[1:a]apad[a]' : '');
+    args.push('-filter_complex', fc, '-map', '[v]', '-map', hasNarr ? '[a]' : '1:a',
+      '-t', sc.duration.toFixed(3), '-r', '30', '-threads', '1', '-filter_threads', '1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', path.join(dir, 'seg' + i + '.mp4'));
+    await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+    segFiles.push(path.join(dir, 'seg' + i + '.mp4'));
+    if (opts.onProgress) opts.onProgress(segFiles.length / totalSegs);
+  }
+
+  const listPath = path.join(dir, 'list.txt');
+  fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\\''") + "'").join('\n'));
+  const concatPath = path.join(dir, 'concat.mp4');
+  await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+
+  // optional music bed: looped under the movie, automatically ducked by narration
+  let bodyPath = concatPath;
+  if (opts.musicFile && fs.existsSync(opts.musicFile)) {
+    const mixedPath = path.join(dir, 'mixed.mp4');
+    const vol = Math.min(Math.max(parseFloat(opts.musicVolume) || 0.3, 0.05), 1);
+    const fc = '[1:a]volume=' + vol.toFixed(2) + '[m];[m][0:a]sidechaincompress=threshold=0.02:ratio=6:attack=200:release=1000[duck];' +
+      '[duck][0:a]amix=inputs=2:duration=first:dropout_transition=2,volume=2.0,alimiter=limit=0.95[a]';
+    await execFileAsync('ffmpeg', ['-y', '-i', concatPath, '-stream_loop', '-1', '-i', opts.musicFile,
+      '-filter_complex', fc, '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-shortest', mixedPath],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+    bodyPath = mixedPath;
+  }
+
+  const finalPath = path.join(dir, 'final.mp4');
+  try {
+    await execFileAsync('ffmpeg', ['-y', '-i', bodyPath, '-i', path.join(dir, 'subtitles.vtt'),
+      '-map', '0', '-map', '1', '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text',
+      '-metadata:s:s:0', 'language=' + movieLangCode(movie.language), finalPath],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
+  } catch (e) {
+    console.error('movie subtitle mux failed, shipping without embedded subs:', e.message);
+    fs.copyFileSync(bodyPath, finalPath);
+    movie.subtitleNote = 'subtitles available at /v1/movie/' + movie.id + '/subtitles (embedding failed: ' + e.message + ')';
+  }
+  for (const f of segFiles) { try { fs.unlinkSync(f); } catch (e) {} }
+  if (opts.titleCard) { try { fs.unlinkSync(path.join(dir, 'title.mp4')); } catch (e) {} }
+  for (const f of [listPath, concatPath, path.join(dir, 'mixed.mp4')]) { try { fs.unlinkSync(f); } catch (e) {} }
+  return Math.round((await mediaDuration(finalPath)) * 100) / 100;
+}
+
+// light metering for the companion endpoints (script preview, assembly retry)
+async function chargeUse(key, n) {
+  const { used } = await getUsage(key);
+  if (used + n > FREE_MONTHLY_LIMIT) return false;
+  await addUsage(key, n);
+  return true;
+}
+
 // ---------- the pipeline ----------
 async function runMoviePipeline(movie, opts) {
   const dir = path.join(MOVIE_DIR, movie.id);
@@ -2661,71 +2806,25 @@ async function runMoviePipeline(movie, opts) {
       await mvSave(movie);
     }
 
-    // 5. subtitles: time each cue to the actual narration/audio length
+    // 5+6. subtitles + assembly (shared with POST /v1/movie/:id/assemble)
+    movie.status = 'assembling';
     movie.progress = 82;
     await mvSave(movie);
-    const cues = [];
-    let cursor = 0;
-    for (let i = 0; i < movie.scenes.length; i++) {
-      const sc = movie.scenes[i];
-      const clipPath = path.join(dir, 'clip' + i + '.mp4');
-      const narrPath = path.join(dir, 'narr' + i + '.mp3');
-      const clipDur = await mediaDuration(clipPath);
-      const narrDur = fs.existsSync(narrPath) ? await mediaDuration(narrPath) : 0;
-      const segDur = Math.max(clipDur, narrDur) + (narrDur ? 0.3 : 0); // small beat after narration
-      sc.duration = Math.round(segDur * 100) / 100;
-      if (sc.narration) cues.push({ start: cursor, end: cursor + segDur, text: sc.narration });
-      cursor += segDur;
+    let musicFile = null;
+    if (opts.musicUrl) {
+      musicFile = path.join(dir, 'music.mp3');
+      try {
+        await retryOnce(() => downloadVideoToDisk(opts.musicUrl, musicFile), 2000);
+      } catch (e) {
+        musicFile = null; // music is optional: finish the movie without it
+        movie.musicNote = 'music download failed, rendered without music: ' + e.message;
+      }
     }
-    const vttPath = path.join(dir, 'subtitles.vtt');
-    fs.writeFileSync(vttPath, buildVtt(cues));
-
-    // 6. assemble: per-scene segment (clip + narration, video padded to audio),
-    //    concat, then mux subtitles as a soft mov_text track
-    movie.status = 'assembling';
-    await mvSave(movie);
-    const segFiles = [];
-    for (let i = 0; i < movie.scenes.length; i++) {
-      const sc = movie.scenes[i];
-      const clipPath = path.join(dir, 'clip' + i + '.mp4');
-      const narrPath = path.join(dir, 'narr' + i + '.mp3');
-      const hasNarr = fs.existsSync(narrPath);
-      const clipDur = await mediaDuration(clipPath);
-      const narrDur = hasNarr ? await mediaDuration(narrPath) : 0;
-      const segDur = Math.max(clipDur, narrDur) + (hasNarr ? 0.3 : 0);
-      const padDur = Math.max(0, segDur - clipDur);
-      const args = ['-y', '-i', clipPath];
-      if (hasNarr) args.push('-i', narrPath); else args.push('-f', 'lavfi', '-t', segDur.toFixed(3), '-i', 'anullsrc=r=44100:cl=mono');
-      const fc = '[0:v]tpad=stop_mode=clone:stop_duration=' + padDur.toFixed(3) +
-        ',scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,crop=' + W + ':' + H + ',format=yuv420p[v]' +
-        (hasNarr ? ';[1:a]apad[a]' : '');
-      args.push('-filter_complex', fc, '-map', '[v]', '-map', hasNarr ? '[a]' : '1:a',
-        '-t', segDur.toFixed(3), '-r', '30', '-threads', '1', '-filter_threads', '1',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
-        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', path.join(dir, 'seg' + i + '.mp4'));
-      await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
-      segFiles.push(path.join(dir, 'seg' + i + '.mp4'));
-      movie.progress = Math.round(82 + 13 * ((i + 1) / movie.scenes.length)); // 82 -> 95
-      await mvSave(movie);
-    }
-    const listPath = path.join(dir, 'list.txt');
-    fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\''") + "'").join('\n'));
-    const concatPath = path.join(dir, 'concat.mp4');
-    await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
-    const finalPath = path.join(dir, 'final.mp4');
-    try {
-      await execFileAsync('ffmpeg', ['-y', '-i', concatPath, '-i', vttPath, '-map', '0', '-map', '1',
-        '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=' + movieLangCode(movie.language), finalPath],
-        { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
-    } catch (e) {
-      // subtitle mux is optional: ship the movie without a soft subtitle track, VTT still served
-      console.error('movie subtitle mux failed, shipping without embedded subs:', e.message);
-      fs.copyFileSync(concatPath, finalPath);
-      movie.subtitleNote = 'subtitles available at /v1/movie/' + movie.id + '/subtitles (embedding failed: ' + e.message + ')';
-    }
-    for (const f of segFiles) { try { fs.unlinkSync(f); } catch (e) {} }
-    try { fs.unlinkSync(concatPath); fs.unlinkSync(listPath); } catch (e) {}
-    movie.duration = Math.round((await mediaDuration(finalPath)) * 100) / 100;
+    movie.duration = await assembleMovie(movie, dir, {
+      W, H, musicFile, musicVolume: opts.musicVolume,
+      burnSubtitles: opts.burnSubtitles, titleCard: opts.titleCard,
+      onProgress: (f) => { movie.progress = Math.round(82 + 13 * f); }
+    });
     movie.status = 'done';
     movie.progress = 100;
     movie.error = null;
@@ -2747,7 +2846,7 @@ function fireMovieWebhook(movie) {
     body: JSON.stringify({
       event: movie.status === 'done' ? 'movie.completed' : 'movie.failed',
       movie_id: movie.id, status: movie.status, error: movie.error || null,
-      videoUrl: movie.status === 'done' ? movie.baseUrl + '/v1/movie/' + movie.id + '/file' : null,
+      videoUrl: movie.status === 'done' ? '/v1/movie/' + movie.id + '/file' : null,
       duration: movie.duration || null, scenes: movie.scenes || []
     })
   }).catch(e => console.error('movie webhook failed:', e.message));
@@ -2772,6 +2871,10 @@ app.post('/v1/movie/create', async (req, res) => {
   const H = aspect === '16:9' ? 720 : 1920;
   const narratorVoice = VOICE_RE.test(String(b.narratorVoice || '')) ? String(b.narratorVoice) : movieDefaultVoice(language);
   const hook = /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(b.webhook || '')) ? String(b.webhook) : null;
+  const musicUrl = /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(b.musicUrl || '')) ? String(b.musicUrl) : null;
+  const musicVolume = Math.min(Math.max(parseFloat(b.musicVolume) || 0.3, 0.05), 1);
+  const burnSubtitles = !!(b.burnSubtitles || b.burnSubs);
+  const titleCard = b.titleCard === undefined ? false : !!b.titleCard;
 
   // daily rate limit: 3 movie creates per key per day
   const daily = await movieDailyUsed(req.apiKey);
@@ -2797,7 +2900,7 @@ app.post('/v1/movie/create', async (req, res) => {
   };
   await mvSave(movie);
   movieDailyIncr(req.apiKey);
-  runMoviePipeline(movie, { story, providedScenes, language, style, rate, W, H }).catch(e => console.error('movie pipeline crashed:', e.message));
+  runMoviePipeline(movie, { story, providedScenes, language, style, rate, W, H, musicUrl, musicVolume, burnSubtitles, titleCard }).catch(e => console.error('movie pipeline crashed:', e.message));
   res.status(202).json({
     movie_id: id, status: 'queued',
     poll: '/v1/movie/' + id, status_url: '/v1/movie/' + id,
@@ -2836,6 +2939,7 @@ app.get('/v1/movie/:id', async (req, res) => {
       clipSource: s.clipSource, duration: s.duration, narrationError: s.narrationError || null
     })),
     subtitleNote: m.subtitleNote || null,
+    musicNote: m.musicNote || null,
     created_at: m.createdAt,
     note: m.restored ? 'state restored from database (service restarted)' : undefined
   });
@@ -2882,6 +2986,101 @@ app.get('/v1/movie/:id/scenes/:idx/:asset', async (req, res) => {
   res.setHeader('Content-Type', spec.type);
   res.setHeader('Content-Disposition', 'attachment; filename="movie-' + m.id.slice(4, 12) + '-scene' + idx + '-' + asset + '.' + spec.file.split('.').pop() + '"');
   fs.createReadStream(p).pipe(res);
+});
+
+
+// ---------- storyboard preview: review scenes before paying for the render ----------
+// POST /v1/movie/script { story, style?, language?, sceneCount? } -> 1 use
+app.post('/v1/movie/script', async (req, res) => {
+  const b = req.body || {};
+  const story = String(b.story || '').trim().slice(0, 4000);
+  if (!story) return res.status(400).json({ error: 'story is required' });
+  if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'Script generation needs GROQ_API_KEY configured on the server' });
+  const language = String(b.language || 'English').trim().slice(0, 40);
+  const style = String(b.style || '').trim().slice(0, 300);
+  const sceneCount = Math.min(Math.max(parseInt(b.sceneCount) || MOVIE_MAX_SCENES, 3), MOVIE_MAX_SCENES);
+  const { used } = await getUsage(req.apiKey);
+  if (used + 1 > FREE_MONTHLY_LIMIT) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT, used });
+  let norm;
+  try {
+    const scenes = await retryOnce(() => groqMovieScenes(story, style, language, sceneCount), 3000);
+    norm = normalizeScriptScenes(scenes);
+  } catch (e) {
+    return res.status(502).json({ error: 'script generation failed: ' + e.message });
+  }
+  if (!norm.length) return res.status(502).json({ error: 'script generation produced no usable scenes' });
+  for (const sc of norm) {
+    if (sc.visualPrompt) {
+      const g = contentGuard(sc.visualPrompt);
+      sc.visualPrompt = g.prompt;
+      if (g.applied) sc.contentGuard = { applied: true, replaced: g.replaced };
+    }
+  }
+  await addUsage(req.apiKey, 1);
+  res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - 1));
+  res.json({
+    scenes: norm.map(sc => ({ id: sc.id, visualPrompt: sc.visualPrompt, narrationText: sc.narrationText, contentGuard: sc.contentGuard || null })),
+    language, suggestedVoice: movieDefaultVoice(language),
+    note: 'Storyboard preview (1 use). Edit these scenes, then pass them as "scenes" to POST /v1/movie/create to render (20 uses).'
+  });
+});
+
+// ---------- assembly retry: re-assemble from preserved assets (no regeneration) ----------
+// POST /v1/movie/:id/assemble { musicUrl?, musicVolume?, burnSubtitles?, titleCard? } -> 1 use
+app.post('/v1/movie/:id/assemble', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  if (['queued', 'scripting', 'processing', 'assembling'].includes(m.status)) {
+    return res.status(409).json({ error: 'movie is still processing (' + m.status + ') — wait for it to finish first' });
+  }
+  const dir = path.join(MOVIE_DIR, m.id);
+  let clipCount = 0;
+  if (Array.isArray(m.scenes)) for (let i = 0; i < m.scenes.length; i++) if (fs.existsSync(movieSceneFiles(dir, i).clip)) clipCount++;
+  if (!clipCount) return res.status(400).json({ error: 'no scene clips on disk for this movie — create a new movie instead' });
+  const b = req.body || {};
+  const musicUrl = /^(https:\/\/|http:\/(localhost|127\.0\.0\.1))/.test(String(b.musicUrl || '')) ? String(b.musicUrl) : null;
+  const musicVolume = Math.min(Math.max(parseFloat(b.musicVolume) || 0.3, 0.05), 1);
+  const burnSubtitles = !!(b.burnSubtitles || b.burnSubs);
+  const titleCard = !!b.titleCard;
+  const W = m.aspect === '16:9' ? 1280 : 1080;
+  const H = m.aspect === '16:9' ? 720 : 1920;
+  const { used } = await getUsage(req.apiKey);
+  if (used + 1 > FREE_MONTHLY_LIMIT) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT, used });
+  await addUsage(req.apiKey, 1);
+  m.status = 'assembling'; m.progress = 50; m.error = null;
+  await mvSave(m);
+  (async () => {
+    try {
+      let musicFile = null;
+      if (musicUrl) {
+        musicFile = path.join(dir, 'music.mp3');
+        try { await retryOnce(() => downloadVideoToDisk(musicUrl, musicFile), 2000); }
+        catch (e) { musicFile = null; m.musicNote = 'music download failed, rendered without music: ' + e.message; }
+      }
+      m.duration = await assembleMovie(m, dir, { W, H, musicFile, musicVolume, burnSubtitles, titleCard, onProgress: (f) => { m.progress = Math.round(50 + 45 * f); } });
+      m.status = 'done'; m.progress = 100; m.error = null;
+      await mvSave(m);
+      fireMovieWebhook(m);
+    } catch (e) {
+      m.status = 'partial'; m.error = 're-assembly failed: ' + e.message;
+      await mvSave(m);
+      fireMovieWebhook(m);
+    }
+  })();
+  res.status(202).json({ movie_id: m.id, status: 'assembling', poll: '/v1/movie/' + m.id, note: 're-assembling from preserved scene assets (no regeneration, 1 use)' });
+});
+
+// ---------- cleanup: free the persistent disk ----------
+app.delete('/v1/movie/:id', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  memoryMovies.delete(m.id);
+  if (pool && !dbBroken) {
+    try { await pool.query('DELETE FROM movies WHERE id = $1', [m.id]); }
+    catch (e) { console.error('movie db delete failed:', e.message); }
+  }
+  try { fs.rmSync(path.join(MOVIE_DIR, m.id), { recursive: true, force: true }); } catch (e) {}
+  res.json({ deleted: true, id: m.id });
 });
 
 // ---------- start ----------

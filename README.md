@@ -72,6 +72,9 @@ subtitle track.
 | `narratorVoice` | edge-tts voice id (e.g. `ar-SA-HamedNeural`); derived from `language` if omitted |
 | `language` | narration language for the LLM (and subtitle track tag) |
 | `aspectRatio` | `9:16` (default, Shorts) or `16:9` |
+| `musicUrl` | optional; https audio file looped as a music bed, automatically ducked under narration (`musicVolume` 0.05-1, default 0.3) |
+| `titleCard` | optional; adds a 2.5s opening card with the movie title |
+| `burnSubtitles` | optional; burns captions into the picture for players that ignore soft subtitle tracks (WhatsApp). Latin scripts only — use soft subs + VTT for Arabic |
 | `webhook` | optional; POSTs `movie.completed` / `movie.failed` with the final payload |
 
 Responses: `202 {movie_id, status_url, ...}` — poll `GET /v1/movie/:id` until
@@ -81,7 +84,12 @@ visualPrompt, clipSource, duration, contentGuard}]}`.
 
 Other routes: `GET /v1/movie/list`, `GET /v1/movie/:id/subtitles` (WebVTT),
 `GET /v1/movie/:id/scenes/:idx/{image|clip|narration}` (per-scene assets,
-preserved even if assembly fails — status becomes `partial` with the error).
+preserved even if assembly fails — status becomes `partial` with the error),
+`POST /v1/movie/script` (storyboard preview, 1 use — review/edit the LLM's
+scenes before paying for the full 20-use render),
+`POST /v1/movie/:id/assemble` (re-assemble a partial/failed/done movie from its
+preserved assets with new options — music, title card, burned subs — no
+regeneration, 1 use), and `DELETE /v1/movie/:id` (frees the persistent disk).
 
 Rules:
 

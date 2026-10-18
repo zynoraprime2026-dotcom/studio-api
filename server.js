@@ -2228,9 +2228,6 @@ app.post('/v1/masjid/answer', async (req, res) => {
   const rate = masjidRate(req.apiKey);
   if (!rate.ok) return res.status(429).json({ error: 'Rate limit: ' + MASJID_ANSWER_HOURLY + ' answer calls per hour per key. Try again next hour.', used_this_hour: rate.count, limit: rate.limit });
 
-  // this endpoint counts as 2 uses: the auth middleware already added 1 (METERED), add the second here
-  await incrUsage(req.apiKey);
-
   // a. prayer times from the Ilm API (keyless endpoint; ILM_API_KEY sent when present)
   let prayerTimes = null;
   const ilmHeaders = { 'User-Agent': 'StudioAPI/1.0' };
@@ -2247,6 +2244,9 @@ app.post('/v1/masjid/answer', async (req, res) => {
   // c. Groq LLM — note: gpt-oss models reject a top-level "system" param; pass it as a system-role message
   const key = process.env.GROQ_API_KEY;
   if (!key) return res.status(503).json({ error: 'Server not configured: GROQ_API_KEY env var missing on the server. Contact the operator.' });
+  // this endpoint counts as 2 uses: the auth middleware already added 1 (METERED), add the second here —
+  // but only once we know the LLM will actually be attempted
+  await incrUsage(req.apiKey);
   const factBlock =
     'Mosque: ' + m.mosqueName + ', ' + m.city + '\n' +
     'Prayer times for today (from the Ilm API): ' + JSON.stringify(prayerTimes) + '\n' +

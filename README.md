@@ -72,7 +72,9 @@ subtitle track.
 | `narratorVoice` | edge-tts voice id (e.g. `ar-SA-HamedNeural`); derived from `language` if omitted |
 | `language` | narration language for the LLM (and subtitle track tag) |
 | `aspectRatio` | `9:16` (default, Shorts) or `16:9` |
-| `musicUrl` | optional; https audio file looped as a music bed, automatically ducked under narration (`musicVolume` 0.05-1, default 0.3) |
+| `musicMood` | `ambient` \| `nasheed` \| `dramatic` \| `calm` \| `upbeat` \| `none`; plays a bundled royalty-free bed from `assets/music/<mood>.mp3` (synthesized on first use — drop any royalty-free file with the same name to replace it), ducked under narration |
+| `musicUrl` | optional; https audio file looped as a music bed, automatically ducked under narration (`musicVolume` 0.05-1, default 0.3). Overrides `musicMood` |
+| `crossfade` | default `true`; 0.5s crossfades between scenes (video and audio), subtitle timings adjust automatically |
 | `titleCard` | optional; adds a 2.5s opening card with the movie title |
 | `burnSubtitles` | optional; burns captions into the picture for players that ignore soft subtitle tracks (WhatsApp). Latin scripts only — use soft subs + VTT for Arabic |
 | `webhook` | optional; POSTs `movie.completed` / `movie.failed` with the final payload |
@@ -82,7 +84,10 @@ Responses: `202 {movie_id, status_url, ...}` — poll `GET /v1/movie/:id` until
 `{videoUrl, duration, scenes:[{id, imageUrl, clipUrl, narration, narrationUrl,
 visualPrompt, clipSource, duration, contentGuard}]}`.
 
-Other routes: `GET /v1/movie/list`, `GET /v1/movie/:id/subtitles` (WebVTT),
+Other routes: `GET /v1/movie/status/:jobId` (spec-shaped job status:
+`{jobId, state: queued|rendering|done|failed, progress: {currentScene,
+totalScenes, step: script|images|animate|narration|subtitles|assembly}, videoUrl,
+scenes, error}`), `GET /v1/movie/list`, `GET /v1/movie/:id/subtitles` (WebVTT),
 `GET /v1/movie/:id/scenes/:idx/{image|clip|narration}` (per-scene assets,
 preserved even if assembly fails — status becomes `partial` with the error),
 `POST /v1/movie/script` (storyboard preview, 1 use — review/edit the LLM's
@@ -98,6 +103,15 @@ with subtitles in the new language. Dubs reuse the source movie's scene clips
 (no re-generation), keep its music bed, and appear as a new owned movie.
 Dubs share the 3/day creation limit; `DUB_USAGE_COST` env (default 10)
 controls the charge.
+
+Pipeline guarantees: movies render one at a time through a sequential background
+worker (the rest queue); scene images retry 3 times (5s apart, honoring
+Pollinations retry-after); a fixed character/setting block is extracted from the
+story and prepended to every scene prompt with a matching fixed seed for visual
+consistency; narration is capped at 120 words per scene and 12 scenes per movie;
+job state persists to the database at every step and unfinished movies are
+re-queued on boot (already-generated scene assets are reused, never
+re-generated).
 
 Rules:
 

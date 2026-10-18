@@ -2448,7 +2448,7 @@ function normalizeScriptScenes(raw) {
   return (Array.isArray(raw) ? raw : []).slice(0, MOVIE_MAX_SCENES).map((s, i) => ({
     id: String((s && (s.id || s.ID)) || ('s' + (i + 1))).slice(0, 12),
     visualPrompt: String((s && (s.visualPrompt || s.visual_prompt || s.prompt)) || '').trim().slice(0, 600),
-    narrationText: String((s && (s.narrationText || s.narration_text || s.narration || s.text)) || '').trim().slice(0, 600),
+    narrationText: String((s && (s.narrationText || s.narration_text || s.narration || s.text)) || '').trim().split(/\s+/).slice(0, 120).join(' ').slice(0, 600),
     imageUrl: (s && s.image && /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(s.image))) ? String(s.image) : null
   })).filter(s => s.visualPrompt || s.narrationText || s.imageUrl);
 }
@@ -2576,6 +2576,124 @@ function movieDefaultVoice(language) {
   return movieLangCode(language) === 'ar' ? 'ar-SA-HamedNeural' : 'en-US-GuyNeural';
 }
 
+// ---------- spec upgrades: retries, character seeds, mood music, job queue, boot resume ----------
+// retry up to N attempts with a wait between (Pollinations-friendly)
+async function retryAsync(fn, attempts, waitMs) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
+}
+
+// deterministic seed from text (character block -> same seed every scene)
+function movieSeedFromText(t) {
+  let h = 7;
+  for (const c of String(t || 'x')) h = (h * 31 + c.charCodeAt(0)) % 1000000;
+  return h;
+}
+
+// extract one fixed CHARACTER & SETTING block from the story (age, build,
+// clothing colors, one distinctive feature, setting) for visual consistency
+async function groqCharacterBlock(story, title) {
+  const key = process.env.GROQ_API_KEY;
+  if (!key || !story) return null;
+  try {
+    const sys = 'Extract the visual identity of this film for consistent AI image generation. ' +
+      'Describe the main character(s): age, build, clothing colors, ONE distinctive feature, plus the setting. ' +
+      'One short paragraph, max 60 words, no names of real or sacred figures. Reply with ONLY the paragraph.';
+    const body = { model: GROQ_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: (title ? 'Title: ' + title + '. ' : '') + 'Story: ' + String(story).slice(0, 4000) }], temperature: 0.4, max_tokens: 200 };
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'StudioAPI/1.0' }, body: JSON.stringify(body)
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) return null;
+    const t = String((d.choices && d.choices[0] && d.choices[0].message.content) || '').trim();
+    return t ? t.slice(0, 400) : null;
+  } catch (e) { return null; }
+}
+
+// ---------- bundled mood music (royalty-free by construction: synthesized) ----------
+// 5 royalty-free beds in <WORK_DIR>/movies/assets/music/<mood>.mp3, generated
+// on demand with ffmpeg. Replace the files with any royalty-free track of the
+// same name to use real music instead.
+const MOVIE_MOODS = ['ambient', 'nasheed', 'dramatic', 'calm', 'upbeat'];
+const musicTrackCache = new Map(); // mood -> {promise}
+function ensureMusicTracks(mood) {
+  const m = MOVIE_MOODS.includes(String(mood || '')) ? String(mood) : 'calm';
+  const dir = path.join(MOVIE_DIR, 'assets', 'music');
+  const p = path.join(dir, m + '.mp3');
+  if (fs.existsSync(p)) return Promise.resolve(p);
+  if (!musicTrackCache.has(m)) {
+    musicTrackCache.set(m, (async () => {
+      fs.mkdirSync(dir, { recursive: true });
+      const synth = {
+        ambient: ['-f','lavfi','-t','40','-i','sine=frequency=110:sample_rate=44100','-f','lavfi','-t','40','-i','sine=frequency=165:sample_rate=44100','-f','lavfi','-t','40','-i','sine=frequency=220:sample_rate=44100','-filter_complex','[0:a][1:a][2:a]amix=inputs=3:normalize=0,tremolo=f=0.25:d=0.35,volume=0.25,afade=t=in:st=0:d=3,afade=t=out:st=37:d=3[a]','-map','[a]'],
+        nasheed: ['-f','lavfi','-t','40','-i','sine=frequency=196:sample_rate=44100','-f','lavfi','-t','40','-i','sine=frequency=294:sample_rate=44100','-f','lavfi','-t','40','-i','anoisesrc=color=brown:sample_rate=44100:amplitude=0.5','-filter_complex','[2:a]lowpass=f=180,tremolo=f=2:d=1,volume=0.7[drum];[0:a][1:a]amix=inputs=2:normalize=0,tremolo=f=0.5:d=0.3,volume=0.16[hum];[hum][drum]amix=inputs=2:normalize=0,alimiter=limit=0.9,afade=t=in:st=0:d=3,afade=t=out:st=37:d=3[a]','-map','[a]'],
+        dramatic: ['-f','lavfi','-t','40','-i','sine=frequency=55:sample_rate=44100','-f','lavfi','-t','40','-i','sine=frequency=65.41:sample_rate=44100','-f','lavfi','-t','40','-i','anoisesrc=color=pink:sample_rate=44100:amplitude=0.4','-filter_complex','[2:a]lowpass=f=300,tremolo=f=1.5:d=1,volume=0.5[pulse];[0:a][1:a]amix=inputs=2:normalize=0,tremolo=f=0.2:d=0.5,volume=0.35[drone];[drone][pulse]amix=inputs=2:normalize=0,alimiter=limit=0.9,afade=t=in:st=0:d=2,afade=t=out:st=38:d=2[a]','-map','[a]'],
+        calm: ['-f','lavfi','-t','40','-i','sine=frequency=261.63:sample_rate=44100','-f','lavfi','-t','40','-i','sine=frequency=329.63:sample_rate=44100','-filter_complex','[0:a][1:a]amix=inputs=2:normalize=0,tremolo=f=0.15:d=0.25,volume=0.2,lowpass=f=2000,afade=t=in:st=0:d=4,afade=t=out:st=36:d=4[a]','-map','[a]'],
+        upbeat: ['-f','lavfi','-t','40','-i','sine=frequency=220:sample_rate=44100','-f','lavfi','-t','40','-i','sine=frequency=277.18:sample_rate=44100','-f','lavfi','-t','40','-i','sine=frequency=329.63:sample_rate=44100','-f','lavfi','-t','40','-i','anoisesrc=color=white:sample_rate=44100:amplitude=0.25','-filter_complex','[3:a]highpass=f=2000,tremolo=f=4:d=1,volume=0.25[tick];[0:a][1:a][2:a]amix=inputs=3:normalize=0,tremolo=f=5:d=0.4,volume=0.22[chord];[chord][tick]amix=inputs=2:normalize=0,alimiter=limit=0.9,afade=t=in:st=0:d=2,afade=t=out:st=38:d=2[a]','-map','[a]']
+      }[m];
+      await execFileAsync('ffmpeg', ['-y', '-v', 'error'].concat(synth, ['-c:a', 'libmp3lame', '-b:a', '128k', p]), { maxBuffer: 1024 * 1024 * 10, timeout: 120000 });
+      return p;
+    })().catch(e => { musicTrackCache.delete(m); throw e; }));
+  }
+  return musicTrackCache.get(m);
+}
+
+// ---------- sequential background worker: one movie job at a time ----------
+// protects free-tier quotas (Pollinations 1 image/45s per IP, ffmpeg CPU)
+const movieQueue = [];
+let movieBusy = false;
+function movieEnqueue(name, fn) {
+  return new Promise(resolve => {
+    movieQueue.push({ name, fn, resolve });
+    movieQueueDrain();
+  });
+}
+async function movieQueueDrain() {
+  if (movieBusy) return;
+  movieBusy = true;
+  try {
+    while (movieQueue.length) {
+      const job = movieQueue.shift();
+      try { await job.fn(); } catch (e) { console.error('movie job failed (' + job.name + '):', e.message); }
+      job.resolve();
+    }
+  } finally { movieBusy = false; }
+}
+
+// boot resume: re-queue unfinished movies; per-step files on disk are reused
+async function resumeUnfinishedMovies() {
+  if (!pool || dbBroken) return;
+  try {
+    const r = await pool.query("SELECT id FROM movies WHERE status IN ('queued','scripting','processing','dubbing','assembling') AND created_at > NOW() - INTERVAL '2 days' ORDER BY created_at ASC");
+    if (!r.rowCount) return;
+    console.log('movie resume: ' + r.rowCount + ' unfinished job(s), re-queueing');
+    for (const row of r.rows) {
+      const m = await mvGetDb(row.id);
+      if (!m || !Array.isArray(m.scenes) || !m.scenes.length) continue;
+      m.baseUrl = process.env.PUBLIC_BASE_URL || ('http://localhost:' + PORT);
+      m.status = 'queued'; m.step = 'images'; m.currentScene = 0; m.totalScenes = m.scenes.length; m.progress = 5;
+      await mvSave(m);
+      movieEnqueue('resume:' + m.id, async () => {
+        try {
+          await runMoviePipeline(m, {
+            story: null,
+            providedScenes: m.scenes.map(s => ({ ...s, imageUrl: null })), // missing images re-generate with the stored prompts
+            language: m.language, style: m.style, rate: '+0%',
+            W: m.aspect === '16:9' ? 1280 : 1080, H: m.aspect === '16:9' ? 720 : 1920,
+            resume: true
+          });
+        } catch (e) { console.error('movie resume failed (' + m.id + '):', e.message); }
+      });
+    }
+  } catch (e) { console.error('movie resume scan failed:', e.message); }
+}
+
 // ---------- stage 5-6 (shared by the pipeline and the retry endpoint) ----------
 const MOVIE_CAP_FONT = fs.existsSync('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf') ? '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' : FONT;
 
@@ -2585,9 +2703,11 @@ function movieSceneFiles(dir, i) {
 
 // recompute per-scene segment durations from the assets on disk (scene length =
 // max(clip, narration) + small beat); returns the VTT cues
-async function computeSceneDurations(movie, dir, included) {
-  let cursor = 0;
-  const cues = [];
+async function computeSceneDurations(movie, dir, included, overlap, titleShift) {
+  const ov = overlap || 0; // seconds trimmed at every boundary (crossfade)
+  const shift = titleShift ? (2.5 - ov) : 0; // title card plays before the first scene
+  const durs = [], cues = [], starts = [];
+  let cursor = shift;
   for (const i of included) {
     const sc = movie.scenes[i];
     const f = movieSceneFiles(dir, i);
@@ -2596,10 +2716,11 @@ async function computeSceneDurations(movie, dir, included) {
     const segDur = Math.max(clipDur, narrDur) + (narrDur ? 0.3 : 0);
     sc.duration = Math.round(segDur * 100) / 100;
     sc.assembled = true;
-    if (sc.narration) cues.push({ start: cursor, end: cursor + segDur, text: sc.narration });
-    cursor += segDur;
+    starts.push(cursor);
+    if (sc.narration) cues.push({ start: cursor, end: cursor + segDur - ov, text: sc.narration });
+    cursor += segDur - ov;
   }
-  return { cues, total: cursor };
+  return { cues, starts, total: cursor + ov };
 }
 
 // hard-sub captions for players that ignore soft subtitle tracks (e.g. WhatsApp)
@@ -2633,7 +2754,8 @@ async function assembleMovie(movie, dir, opts) {
   for (let i = 0; i < movie.scenes.length; i++) if (fs.existsSync(movieSceneFiles(dir, i).clip)) included.push(i);
   if (!included.length) throw new Error('no scene clips on disk to assemble (assets were not generated for this movie)');
   for (const sc of movie.scenes) sc.assembled = false;
-  const { cues } = await computeSceneDurations(movie, dir, included);
+  const overlap = (opts.crossfade && included.length + (opts.titleCard ? 1 : 0) > 1) ? 0.5 : 0;
+  const { cues, starts } = await computeSceneDurations(movie, dir, included, overlap, opts.titleCard);
   fs.writeFileSync(path.join(dir, 'subtitles.vtt'), buildVtt(cues));
 
   const totalSegs = included.length + (opts.titleCard ? 1 : 0);
@@ -2678,10 +2800,33 @@ async function assembleMovie(movie, dir, opts) {
     if (opts.onProgress) opts.onProgress(segFiles.length / totalSegs);
   }
 
-  const listPath = path.join(dir, 'list.txt');
-  fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\\''") + "'").join('\n'));
-  const concatPath = path.join(dir, 'concat.mp4');
-  await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+  let concatPath = path.join(dir, 'concat.mp4');
+  if (overlap) {
+    // 0.5s crossfades between segments (video xfade + audio acrossfade)
+    const args = ['-y'];
+    for (const f of segFiles) args.push('-i', f);
+    const n = segFiles.length;
+    // per-segment durations (title card first if present) -> xfade offsets in the output timeline
+    const segDurs = (opts.titleCard ? [2.5] : []).concat(included.map(i => movie.scenes[i].duration || 5));
+    const fcParts = [];
+    let vLast = '0:v', aLast = '0:a';
+    for (let k = 1; k < n; k++) {
+      const off = Math.max(0, segDurs.slice(0, k).reduce((a, b) => a + b, 0) - overlap * k);
+      const vOut = 'vx' + k, aOut = 'ax' + k;
+      fcParts.push('[' + vLast + '][' + k + ':v]xfade=transition=fade:duration=0.5:offset=' + off.toFixed(3) + '[' + vOut + ']');
+      fcParts.push('[' + aLast + '][' + k + ':a]acrossfade=d=0.5[' + aOut + ']');
+      vLast = vOut; aLast = aOut;
+    }
+    args.push('-filter_complex', fcParts.join(';'), '-map', '[' + vLast + ']', '-map', '[' + aLast + ']',
+      '-r', '30', '-threads', '1', '-filter_threads', '1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', concatPath);
+    await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 15 * 60 * 1000 });
+  } else {
+    const listPath = path.join(dir, 'list.txt');
+    fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\\''") + "'").join('\n'));
+    await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+  }
 
   // optional music bed: looped under the movie, automatically ducked by narration
   let bodyPath = concatPath;
@@ -2709,7 +2854,7 @@ async function assembleMovie(movie, dir, opts) {
   }
   for (const f of segFiles) { try { fs.unlinkSync(f); } catch (e) {} }
   if (opts.titleCard) { try { fs.unlinkSync(path.join(dir, 'title.mp4')); } catch (e) {} }
-  for (const f of [listPath, concatPath, path.join(dir, 'mixed.mp4')]) { try { fs.unlinkSync(f); } catch (e) {} }
+  for (const f of [path.join(dir, 'list.txt'), concatPath, path.join(dir, 'mixed.mp4')]) { try { fs.unlinkSync(f); } catch (e) {} }
   return Math.round((await mediaDuration(finalPath)) * 100) / 100;
 }
 
@@ -2726,9 +2871,9 @@ async function runMoviePipeline(movie, opts) {
   const dir = path.join(MOVIE_DIR, movie.id);
   fs.mkdirSync(dir, { recursive: true });
   const W = opts.W, H = opts.H;
-  const movieSeed = parseInt(movie.id.slice(4, 12), 16) % 1000000; // same seed every scene -> visual consistency
   try {
     movie.status = 'scripting';
+    movie.step = 'script';
     movie.progress = 3;
     await mvSave(movie);
 
@@ -2738,6 +2883,18 @@ async function runMoviePipeline(movie, opts) {
     else rawScenes = await retryOnce(() => groqMovieScenes(opts.story, opts.style, opts.language, MOVIE_MAX_SCENES), 3000);
     const scenes = normalizeScriptScenes(rawScenes);
     if (!scenes.length) throw new Error('script produced no usable scenes');
+    // character consistency: one fixed character/setting block (age, build,
+    // clothing colors, distinctive feature) prepended to EVERY scene prompt, and
+    // a seed derived from that block so all scenes share the same visual identity.
+    // On resume the block is already baked into the stored prompts.
+    if (!opts.resume) {
+      const characterBlock = await groqCharacterBlock(opts.story, movie.title);
+      if (characterBlock) {
+        movie.characterBlock = characterBlock;
+        for (const sc of scenes) if (sc.visualPrompt) sc.visualPrompt = (characterBlock + ', ' + sc.visualPrompt).slice(0, 700);
+      }
+    }
+    const movieSeed = movieSeedFromText(movie.characterBlock || movie.title || movie.id);
     for (const sc of scenes) {
       if (sc.visualPrompt) {
         const g = contentGuard(sc.visualPrompt);
@@ -2746,8 +2903,21 @@ async function runMoviePipeline(movie, opts) {
       }
     }
     // storyboard is visible right away; per-scene outputs are filled in as they finish
-    movie.scenes = scenes.map(sc => ({ id: sc.id, visualPrompt: sc.visualPrompt || null, narration: sc.narrationText || null, contentGuard: sc.contentGuard || null, imageUrl: null, clipUrl: null, narrationUrl: null, clipSource: null, duration: null, narrationError: null }));
+    movie.scenes = scenes.map((sc, idx) => {
+      const prev = (opts.resume && opts.providedScenes && opts.providedScenes[idx]) || null;
+      return {
+        id: sc.id, visualPrompt: sc.visualPrompt || (prev && prev.visualPrompt) || null,
+        narration: sc.narrationText || (prev && prev.narration) || null,
+        contentGuard: sc.contentGuard || (prev && prev.contentGuard) || null,
+        imageUrl: (prev && prev.imageUrl) || null, imageSourceUrl: (prev && prev.imageSourceUrl) || null,
+        clipUrl: (prev && prev.clipUrl) || null, narrationUrl: (prev && prev.narrationUrl) || null,
+        clipSource: (prev && prev.clipSource) || null, duration: (prev && prev.duration) || null,
+        narrationError: (prev && prev.narrationError) || null
+      };
+    });
     movie.status = 'processing';
+    movie.totalScenes = movie.scenes.length;
+    movie.currentScene = 0;
     movie.progress = 6;
     await mvSave(movie);
 
@@ -2758,7 +2928,7 @@ async function runMoviePipeline(movie, opts) {
       const out = movie.scenes[i]; // storyboard object created above, enriched per step
       const assetBase = movie.baseUrl + '/v1/movie/' + movie.id + '/scenes/' + i + '/';
 
-      // image
+      // image (idempotent: a file from a previous run is reused; 3 attempts, 5s apart)
       let imageUrl = sc.imageUrl;
       if (!imageUrl) {
         const fullPrompt = [sc.visualPrompt, opts.style, 'cinematic film still, consistent characters and setting across all scenes'].filter(Boolean).join(', ');
@@ -2766,48 +2936,62 @@ async function runMoviePipeline(movie, opts) {
         imageUrl = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(fullPrompt) + '?' + params;
       }
       const imgPath = path.join(dir, 'scene' + i + '.jpg');
-      await mvFetchImage(imageUrl, imgPath);
+      movie.step = 'images';
+      await mvSave(movie);
+      if (!fs.existsSync(imgPath)) {
+        await retryAsync(() => mvFetchImage(imageUrl, imgPath), 3, 5000);
+        out.imageSourceUrl = imageUrl;
+      }
       out.imageUrl = assetBase + 'image';
-      out.imageSourceUrl = imageUrl;
       movie.progress = Math.round(6 + per * (i + 0.4));
       await mvSave(movie);
 
-      // animate (real motion; Ken Burns fallback so the movie still completes)
+      // animate (real motion; Ken Burns fallback so the movie still completes; idempotent)
       const clipPath = path.join(dir, 'clip' + i + '.mp4');
       const animPrompt = [sc.visualPrompt, opts.style].filter(Boolean).join(', ') || 'slow cinematic camera drift, subtle motion';
-      if (movieI2VProviders().length) {
-        try {
-          const r = await retryOnce(() => movieI2VClip(out.imageSourceUrl || imageUrl, animPrompt, 5), 3000);
-          await downloadVideoToDisk(r.videoUrl, clipPath);
-          out.clipSource = r.model;
-        } catch (e) {
-          console.error('movie scene ' + i + ' i2v failed, using Ken Burns fallback:', e.message);
+      if (!fs.existsSync(clipPath)) {
+        movie.step = 'animate';
+        await mvSave(movie);
+        if (movieI2VProviders().length) {
+          try {
+            const r = await retryOnce(() => movieI2VClip(out.imageSourceUrl || imageUrl, animPrompt, 5), 3000);
+            await downloadVideoToDisk(r.videoUrl, clipPath);
+            out.clipSource = r.model;
+          } catch (e) {
+            console.error('movie scene ' + i + ' i2v failed, using Ken Burns fallback:', e.message);
+          }
         }
-      }
-      if (!out.clipSource) {
-        await retryOnce(() => movieKenBurns(imgPath, clipPath, 5, W, H), 2000);
-        out.clipSource = 'ken_burns';
+        if (!out.clipSource) {
+          await retryOnce(() => movieKenBurns(imgPath, clipPath, 5, W, H), 2000);
+          out.clipSource = 'ken_burns';
+        }
       }
       out.clipUrl = assetBase + 'clip';
       movie.progress = Math.round(6 + per * (i + 0.8));
       await mvSave(movie);
 
-      // narration
+      // narration (silent-scene fallback; idempotent)
       if (sc.narrationText) {
         const narrPath = path.join(dir, 'narr' + i + '.mp3');
-        try {
-          await retryOnce(() => speakText(sc.narrationText, movie.narratorVoice, opts.rate, narrPath), 2000);
-          out.narrationUrl = assetBase + 'narration';
-        } catch (e) {
-          out.narrationError = 'narration failed: ' + e.message; // scene continues silently
+        movie.step = 'narration';
+        await mvSave(movie);
+        if (!fs.existsSync(narrPath)) {
+          try {
+            await retryOnce(() => speakText(sc.narrationText, movie.narratorVoice, opts.rate, narrPath), 2000);
+          } catch (e) {
+            out.narrationError = 'narration failed: ' + e.message; // scene continues silently
+          }
         }
+        if (fs.existsSync(narrPath)) out.narrationUrl = assetBase + 'narration';
       }
+      movie.currentScene = i + 1;
       movie.progress = Math.round(6 + per * (i + 1));
       await mvSave(movie);
     }
 
     // 5+6. subtitles + assembly (shared with POST /v1/movie/:id/assemble)
     movie.status = 'assembling';
+    movie.step = 'subtitles';
     movie.progress = 82;
     await mvSave(movie);
     let musicFile = null;
@@ -2819,10 +3003,17 @@ async function runMoviePipeline(movie, opts) {
         musicFile = null; // music is optional: finish the movie without it
         movie.musicNote = 'music download failed, rendered without music: ' + e.message;
       }
+    } else if (fs.existsSync(path.join(dir, 'music.mp3'))) {
+      musicFile = path.join(dir, 'music.mp3'); // resumed run: keep the bed already on disk
+    } else if (opts.musicMood && opts.musicMood !== 'none') {
+      try { musicFile = await ensureMusicTracks(opts.musicMood); }
+      catch (e) { movie.musicNote = 'music bed unavailable: ' + e.message; }
     }
+    movie.step = 'assembly';
+    await mvSave(movie);
     movie.duration = await assembleMovie(movie, dir, {
       W, H, musicFile, musicVolume: opts.musicVolume,
-      burnSubtitles: opts.burnSubtitles, titleCard: opts.titleCard,
+      burnSubtitles: opts.burnSubtitles, titleCard: opts.titleCard, crossfade: opts.crossfade,
       onProgress: (f) => { movie.progress = Math.round(82 + 13 * f); }
     });
     movie.status = 'done';
@@ -2875,6 +3066,8 @@ app.post('/v1/movie/create', async (req, res) => {
   const musicVolume = Math.min(Math.max(parseFloat(b.musicVolume) || 0.3, 0.05), 1);
   const burnSubtitles = !!(b.burnSubtitles || b.burnSubs);
   const titleCard = b.titleCard === undefined ? false : !!b.titleCard;
+  const musicMood = MOVIE_MOODS.concat('none').includes(String(b.musicMood || '').trim().toLowerCase()) ? String(b.musicMood).trim().toLowerCase() : null;
+  const crossfade = b.crossfade === undefined ? true : !!b.crossfade; // 0.5s crossfades between scenes
 
   // daily rate limit: 3 movie creates per key per day
   const daily = await movieDailyUsed(req.apiKey);
@@ -2900,13 +3093,34 @@ app.post('/v1/movie/create', async (req, res) => {
   };
   await mvSave(movie);
   movieDailyIncr(req.apiKey);
-  runMoviePipeline(movie, { story, providedScenes, language, style, rate, W, H, musicUrl, musicVolume, burnSubtitles, titleCard }).catch(e => console.error('movie pipeline crashed:', e.message));
+  // sequential background worker: one movie renders at a time, the rest queue
+  movieEnqueue('create:' + id, async () => {
+    try { await runMoviePipeline(movie, { story, providedScenes, language, style, rate, W, H, musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade }); }
+    catch (e) { console.error('movie pipeline crashed:', e.message); }
+  });
   res.status(202).json({
-    movie_id: id, status: 'queued',
+    movie_id: id, jobId: id, status: 'queued',
     poll: '/v1/movie/' + id, status_url: '/v1/movie/' + id,
     video_url: '/v1/movie/' + id + '/file', subtitles_url: '/v1/movie/' + id + '/subtitles',
     scene_count_planned: providedScenes ? providedScenes.length : null,
     cost: MOVIE_USAGE_COST + ' uses', daily_limit: MOVIE_DAILY_LIMIT, webhook: !!hook
+  });
+});
+
+// spec-shaped job status: GET /v1/movie/status/:jobId
+app.get('/v1/movie/status/:jobId', async (req, res) => {
+  const m = await mvOwn(req.params.jobId, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const state = m.status === 'done' ? 'done'
+    : ['partial', 'failed'].includes(m.status) ? 'failed'
+    : m.status === 'queued' ? 'queued' : 'rendering';
+  const done = state === 'done';
+  res.json({
+    jobId: m.id, state,
+    progress: { currentScene: m.currentScene || null, totalScenes: m.totalScenes || (Array.isArray(m.scenes) ? m.scenes.length : null), step: m.step || null, percent: m.progress },
+    videoUrl: done ? '/v1/movie/' + m.id + '/file' : null,
+    scenes: done ? (m.scenes || []).map(s => ({ imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration })) : null,
+    error: m.error || null
   });
 });
 
@@ -2940,6 +3154,7 @@ app.get('/v1/movie/:id', async (req, res) => {
     })),
     subtitleNote: m.subtitleNote || null,
     musicNote: m.musicNote || null,
+    step: m.step || null, currentScene: m.currentScene || null, totalScenes: m.totalScenes || (Array.isArray(m.scenes) ? m.scenes.length : null),
     created_at: m.createdAt,
     note: m.restored ? 'state restored from database (service restarted)' : undefined
   });
@@ -3042,6 +3257,7 @@ app.post('/v1/movie/:id/assemble', async (req, res) => {
   const musicVolume = Math.min(Math.max(parseFloat(b.musicVolume) || 0.3, 0.05), 1);
   const burnSubtitles = !!(b.burnSubtitles || b.burnSubs);
   const titleCard = !!b.titleCard;
+  const crossfade = b.crossfade === undefined ? true : !!b.crossfade;
   const W = m.aspect === '16:9' ? 1280 : 1080;
   const H = m.aspect === '16:9' ? 720 : 1920;
   const { used } = await getUsage(req.apiKey);
@@ -3049,15 +3265,18 @@ app.post('/v1/movie/:id/assemble', async (req, res) => {
   await addUsage(req.apiKey, 1);
   m.status = 'assembling'; m.progress = 50; m.error = null;
   await mvSave(m);
-  (async () => {
+  movieEnqueue('assemble:' + m.id, async () => {
     try {
       let musicFile = null;
       if (musicUrl) {
         musicFile = path.join(dir, 'music.mp3');
         try { await retryOnce(() => downloadVideoToDisk(musicUrl, musicFile), 2000); }
         catch (e) { musicFile = null; m.musicNote = 'music download failed, rendered without music: ' + e.message; }
+      } else if (fs.existsSync(path.join(dir, 'music.mp3'))) {
+        musicFile = path.join(dir, 'music.mp3');
       }
-      m.duration = await assembleMovie(m, dir, { W, H, musicFile, musicVolume, burnSubtitles, titleCard, onProgress: (f) => { m.progress = Math.round(50 + 45 * f); } });
+      m.step = 'assembly';
+      m.duration = await assembleMovie(m, dir, { W, H, musicFile, musicVolume, burnSubtitles, titleCard, crossfade, onProgress: (f) => { m.progress = Math.round(50 + 45 * f); } });
       m.status = 'done'; m.progress = 100; m.error = null;
       await mvSave(m);
       fireMovieWebhook(m);
@@ -3066,7 +3285,7 @@ app.post('/v1/movie/:id/assemble', async (req, res) => {
       await mvSave(m);
       fireMovieWebhook(m);
     }
-  })();
+  });
   res.status(202).json({ movie_id: m.id, status: 'assembling', poll: '/v1/movie/' + m.id, note: 're-assembling from preserved scene assets (no regeneration, 1 use)' });
 });
 
@@ -3144,6 +3363,7 @@ app.post('/v1/movie/:id/dub', async (req, res) => {
   const musicVolume = Math.min(Math.max(parseFloat(b.musicVolume) || 0.3, 0.05), 1);
   const burnSubtitles = !!(b.burnSubtitles || b.burnSubs);
   const titleCard = b.titleCard === undefined ? false : !!b.titleCard;
+  const crossfade = b.crossfade === undefined ? true : !!b.crossfade;
 
   // explicit translations skip the LLM entirely (offline/localized workflows)
   const explicit = Array.isArray(b.scenes) ? b.scenes : null;
@@ -3192,15 +3412,17 @@ app.post('/v1/movie/:id/dub', async (req, res) => {
   res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - DUB_USAGE_COST));
   res.status(202).json({ movie_id: id, status: 'dubbing', poll: '/v1/movie/' + id, dub_of: m.id, language, narratorVoice: voice, cost: DUB_USAGE_COST + ' uses' });
 
-  (async () => {
+  movieEnqueue('dub:' + id, async () => {
     try {
       const dir = path.join(MOVIE_DIR, id);
       fs.mkdirSync(dir, { recursive: true });
       const W = dub.aspect === '16:9' ? 1280 : 1080;
       const H = dub.aspect === '16:9' ? 720 : 1920;
       const per = 74 / dub.scenes.length;
+      dub.totalScenes = dub.scenes.length; dub.currentScene = 0; dub.step = 'narration';
       for (let k = 0; k < idxs.length; k++) {
         const i = idxs[k];
+        dub.currentScene = k + 1;
         const src = movieSceneFiles(srcDir, i), dst = movieSceneFiles(dir, k);
         fs.copyFileSync(src.clip, dst.clip);
         if (fs.existsSync(src.img)) fs.copyFileSync(src.img, dst.img);
@@ -3217,10 +3439,10 @@ app.post('/v1/movie/:id/dub', async (req, res) => {
       let musicFile = null;
       const srcMusic = path.join(srcDir, 'music.mp3');
       if (fs.existsSync(srcMusic)) { musicFile = path.join(dir, 'music.mp3'); try { fs.copyFileSync(srcMusic, musicFile); } catch (e) { musicFile = null; } }
-      dub.status = 'assembling'; dub.progress = 82;
+      dub.status = 'assembling'; dub.step = 'assembly'; dub.progress = 82;
       await mvSave(dub);
       dub.duration = await assembleMovie(dub, dir, {
-        W, H, musicFile, musicVolume, burnSubtitles, titleCard,
+        W, H, musicFile, musicVolume, burnSubtitles, titleCard, crossfade,
         onProgress: (f) => { dub.progress = Math.round(82 + 13 * f); }
       });
       dub.status = 'done'; dub.progress = 100; dub.error = null;
@@ -3231,15 +3453,15 @@ app.post('/v1/movie/:id/dub', async (req, res) => {
       await mvSave(dub);
       fireMovieWebhook(dub);
     }
-  })().catch(e => console.error('dub pipeline crashed:', e.message));
+  });
 });
 
 // ---------- start ----------
 initDb()
   .then(() => {
-    app.listen(PORT, () => console.log(`studio-api listening on port ${PORT}`));
+    app.listen(PORT, () => { console.log(`studio-api listening on port ${PORT}`); resumeUnfinishedMovies(); });
   })
   .catch((e) => {
     console.error('DB init failed, starting without DB keys:', e.message);
-    app.listen(PORT, () => console.log(`studio-api listening on port ${PORT} (no DB)`));
+    app.listen(PORT, () => { console.log(`studio-api listening on port ${PORT} (no DB)`); resumeUnfinishedMovies(); });
   });

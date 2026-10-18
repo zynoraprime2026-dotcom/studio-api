@@ -89,7 +89,15 @@ preserved even if assembly fails — status becomes `partial` with the error),
 scenes before paying for the full 20-use render),
 `POST /v1/movie/:id/assemble` (re-assemble a partial/failed/done movie from its
 preserved assets with new options — music, title card, burned subs — no
-regeneration, 1 use), and `DELETE /v1/movie/:id` (frees the persistent disk).
+regeneration, 1 use), `DELETE /v1/movie/:id` (frees the persistent disk), and
+`POST /v1/movie/:id/dub` — re-narrate a finished movie in another language
+(Arabic, French, Spanish, German, Swahili, English; 10 uses): narration is
+translated by the LLM (or pass explicit `scenes:[{narrationText}]` lines to
+skip it), re-spoken with a language-appropriate edge-tts voice, and re-assembled
+with subtitles in the new language. Dubs reuse the source movie's scene clips
+(no re-generation), keep its music bed, and appear as a new owned movie.
+Dubs share the 3/day creation limit; `DUB_USAGE_COST` env (default 10)
+controls the charge.
 
 Rules:
 

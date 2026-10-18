@@ -3083,6 +3083,157 @@ app.delete('/v1/movie/:id', async (req, res) => {
   res.json({ deleted: true, id: m.id });
 });
 
+
+// ---------- movie dubbing: re-narrate a finished movie in another language ----------
+// POST /v1/movie/:id/dub { language, narratorVoice?, narrationRate?, scenes?, musicVolume?, titleCard?, burnSubtitles?, webhook? } -> 10 uses
+// Reuses the source movie's scene clips (no re-generation). Narration is
+// translated by the LLM unless explicit "scenes":[{narrationText}] lines are
+// given, then re-spoken with an edge-tts voice for the target language and
+// re-assembled with subtitles in the new language.
+const DUB_USAGE_COST = parseInt(process.env.DUB_USAGE_COST) || 10;
+const DUB_VOICES = {
+  arabic: 'ar-SA-HamedNeural', ar: 'ar-SA-HamedNeural',
+  french: 'fr-FR-HenriNeural', fr: 'fr-FR-HenriNeural',
+  spanish: 'es-ES-AlvaroNeural', es: 'es-ES-AlvaroNeural',
+  german: 'de-DE-KillianNeural', de: 'de-DE-KillianNeural',
+  swahili: 'sw-KE-RafiqNeural', sw: 'sw-KE-RafiqNeural',
+  english: 'en-US-GuyNeural', en: 'en-US-GuyNeural'
+};
+function dubVoice(language) { return DUB_VOICES[String(language || '').trim().toLowerCase()] || 'en-US-GuyNeural'; }
+
+async function groqTranslateNarrations(narrations, language) {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new Error('GROQ_API_KEY is not configured on the server (needed when explicit scenes are not provided)');
+  const sys = 'You are a professional film narration translator. Translate each numbered narration line into ' + language + '. ' +
+    'Keep the meaning, tone and length close to the original so each line still fits its scene as spoken narration. ' +
+    'Reply with ONLY a JSON object: {"lines":["...","..."]} with exactly ' + narrations.length + ' strings in the same order. No commentary.';
+  const body = { model: GROQ_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify({ lines: narrations }) }], temperature: 0.3, max_tokens: 2500, response_format: { type: 'json_object' } };
+  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST', headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'StudioAPI/1.0' },
+    body: JSON.stringify(body)
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((d.error && d.error.message) || 'Groq request failed');
+  const txt = d.choices[0].message.content;
+  let parsed = null;
+  try { parsed = JSON.parse(txt); } catch (e) {
+    const m = txt.match(/\{[\s\S]*\}/);
+    if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) {} }
+  }
+  const lines = parsed && (Array.isArray(parsed.lines) ? parsed.lines : null);
+  if (!lines || lines.length !== narrations.length) throw new Error('translation count mismatch (expected ' + narrations.length + ' lines)');
+  return lines.map(l => String(l || '').trim().slice(0, 400));
+}
+
+app.post('/v1/movie/:id/dub', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  if (['queued', 'scripting', 'processing', 'assembling'].includes(m.status)) {
+    return res.status(409).json({ error: 'movie is still processing (' + m.status + ') — wait for it to finish first' });
+  }
+  const srcDir = path.join(MOVIE_DIR, m.id);
+  const idxs = (m.scenes || []).map((s, i) => i).filter(i => fs.existsSync(movieSceneFiles(srcDir, i).clip));
+  if (!idxs.length) return res.status(400).json({ error: 'source movie has no scene clips on disk — nothing to dub (create a new movie instead)' });
+
+  const b = req.body || {};
+  const language = String(b.language || '').trim().slice(0, 40);
+  if (!language) return res.status(400).json({ error: 'language is required (e.g. "Arabic", "French")' });
+  const voice = VOICE_RE.test(String(b.narratorVoice || '')) ? String(b.narratorVoice) : dubVoice(language);
+  const rate = /^-?\d+%$/.test(String(b.narrationRate || '')) ? String(b.narrationRate) : '+0%';
+  const hook = /^(https:\/\/|http:\/(localhost|127\.0\.0\.1))/.test(String(b.webhook || '')) ? String(b.webhook) : null;
+  const musicVolume = Math.min(Math.max(parseFloat(b.musicVolume) || 0.3, 0.05), 1);
+  const burnSubtitles = !!(b.burnSubtitles || b.burnSubs);
+  const titleCard = b.titleCard === undefined ? false : !!b.titleCard;
+
+  // explicit translations skip the LLM entirely (offline/localized workflows)
+  const explicit = Array.isArray(b.scenes) ? b.scenes : null;
+  if (explicit && explicit.length && !explicit.some(s => s && String((s.narrationText || '')).trim())) {
+    return res.status(400).json({ error: 'scenes provided but no narrationText found — pass one narrationText per scene' });
+  }
+  if (!explicit && !process.env.GROQ_API_KEY) {
+    return res.status(503).json({ error: 'Dubbing without explicit "scenes" translations needs GROQ_API_KEY configured on the server' });
+  }
+
+  // dubs share the daily creation limit: heavy TTS + assembly work
+  const daily = await movieDailyUsed(req.apiKey);
+  if (daily.count >= MOVIE_DAILY_LIMIT) {
+    return res.status(429).json({ error: 'Rate limit: ' + MOVIE_DAILY_LIMIT + ' movie creations/dubs per key per day. Try again tomorrow.', used_today: daily.count, limit: MOVIE_DAILY_LIMIT });
+  }
+  const { used } = await getUsage(req.apiKey);
+  if (used + DUB_USAGE_COST > FREE_MONTHLY_LIMIT) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT, used });
+
+  let translations = null;
+  if (explicit && explicit.length) {
+    translations = idxs.map((i, k) => (explicit[k] && String((explicit[k].narrationText || '')).trim()) || null);
+  } else {
+    try {
+      translations = await retryOnce(() => groqTranslateNarrations(idxs.map(i => m.scenes[i].narration || ''), language), 3000);
+    } catch (e) {
+      return res.status(502).json({ error: 'translation failed: ' + e.message });
+    }
+  }
+
+  await addUsage(req.apiKey, DUB_USAGE_COST);
+  const id = 'mov_' + crypto.randomUUID();
+  const dubBaseUrl = 'https://' + req.get('host');
+  const dub = {
+    id, key: m.key, title: String(m.title).slice(0, 140) + ' [' + language + ']',
+    status: 'dubbing', progress: 0, error: null, language, style: m.style,
+    aspect: m.aspect, narratorVoice: voice, webhook: hook, dubOf: m.id,
+    duration: null, createdAt: new Date().toISOString(), baseUrl: dubBaseUrl,
+    // storyboard visible right away; narration filled per scene below; asset
+    // URLs point at the dub's own copied files
+    scenes: idxs.map((i, k) => ({ ...m.scenes[i], narration: null, duration: null, narrationError: null,
+      imageUrl: dubBaseUrl + '/v1/movie/' + id + '/scenes/' + k + '/image',
+      clipUrl: dubBaseUrl + '/v1/movie/' + id + '/scenes/' + k + '/clip',
+      narrationUrl: dubBaseUrl + '/v1/movie/' + id + '/scenes/' + k + '/narration' }))
+  };
+  await mvSave(dub);
+  res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - DUB_USAGE_COST));
+  res.status(202).json({ movie_id: id, status: 'dubbing', poll: '/v1/movie/' + id, dub_of: m.id, language, narratorVoice: voice, cost: DUB_USAGE_COST + ' uses' });
+
+  (async () => {
+    try {
+      const dir = path.join(MOVIE_DIR, id);
+      fs.mkdirSync(dir, { recursive: true });
+      const W = dub.aspect === '16:9' ? 1280 : 1080;
+      const H = dub.aspect === '16:9' ? 720 : 1920;
+      const per = 74 / dub.scenes.length;
+      for (let k = 0; k < idxs.length; k++) {
+        const i = idxs[k];
+        const src = movieSceneFiles(srcDir, i), dst = movieSceneFiles(dir, k);
+        fs.copyFileSync(src.clip, dst.clip);
+        if (fs.existsSync(src.img)) fs.copyFileSync(src.img, dst.img);
+        const text = (translations[k] || m.scenes[i].narration || '').trim();
+        dub.scenes[k].narration = text;
+        if (text) {
+          try { await speakText(text, voice, rate, dst.narr); }
+          catch (e) { dub.scenes[k].narrationError = e.message; }
+        }
+        dub.progress = Math.round(6 + per * (k + 1));
+        await mvSave(dub);
+      }
+      // keep the source movie's music bed if it has one on disk
+      let musicFile = null;
+      const srcMusic = path.join(srcDir, 'music.mp3');
+      if (fs.existsSync(srcMusic)) { musicFile = path.join(dir, 'music.mp3'); try { fs.copyFileSync(srcMusic, musicFile); } catch (e) { musicFile = null; } }
+      dub.status = 'assembling'; dub.progress = 82;
+      await mvSave(dub);
+      dub.duration = await assembleMovie(dub, dir, {
+        W, H, musicFile, musicVolume, burnSubtitles, titleCard,
+        onProgress: (f) => { dub.progress = Math.round(82 + 13 * f); }
+      });
+      dub.status = 'done'; dub.progress = 100; dub.error = null;
+      await mvSave(dub);
+      fireMovieWebhook(dub);
+    } catch (e) {
+      dub.status = 'partial'; dub.error = 'dub failed: ' + e.message;
+      await mvSave(dub);
+      fireMovieWebhook(dub);
+    }
+  })().catch(e => console.error('dub pipeline crashed:', e.message));
+});
+
 // ---------- start ----------
 initDb()
   .then(() => {

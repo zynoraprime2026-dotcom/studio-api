@@ -104,6 +104,13 @@ with subtitles in the new language. Dubs reuse the source movie's scene clips
 Dubs share the 3/day creation limit; `DUB_USAGE_COST` env (default 10)
 controls the charge.
 
+Durability: every generated asset (scene image, clip, narration, final.mp4,
+subtitles.vtt) is mirrored into Postgres (`movie_assets` table, capped by
+`MOVIE_ASSET_MAX_BYTES`, default 64MB/asset) and transparently restored to
+disk on demand — GET /file, /subtitles, /scenes/:i/:asset, assembly retries
+and boot resume all serve from the mirror after a restart, even without a
+persistent disk (free tiers). Deleting a movie removes its mirrored assets.
+
 Pipeline guarantees: movies render one at a time through a sequential background
 worker (the rest queue); scene images retry 3 times (5s apart, honoring
 Pollinations retry-after); a fixed character/setting block is extracted from the

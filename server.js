@@ -354,6 +354,14 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS movie_assets (
+      movie_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      idx INT NOT NULL DEFAULT 0,
+      bytes BYTEA,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (movie_id, kind, idx)
+    );
   `);
 }
 
@@ -2938,10 +2946,11 @@ async function runMoviePipeline(movie, opts) {
       const imgPath = path.join(dir, 'scene' + i + '.jpg');
       movie.step = 'images';
       await mvSave(movie);
-      if (!fs.existsSync(imgPath)) {
+      if (!fs.existsSync(imgPath) && !(await mvRestoreAsset(movie.id, 'scene' + i + '.jpg'))) {
         await retryAsync(() => mvFetchImage(imageUrl, imgPath), 3, 5000);
         out.imageSourceUrl = imageUrl;
       }
+      await mvSaveAsset(movie.id, 'scene' + i + '.jpg');
       out.imageUrl = assetBase + 'image';
       movie.progress = Math.round(6 + per * (i + 0.4));
       await mvSave(movie);
@@ -2949,6 +2958,7 @@ async function runMoviePipeline(movie, opts) {
       // animate (real motion; Ken Burns fallback so the movie still completes; idempotent)
       const clipPath = path.join(dir, 'clip' + i + '.mp4');
       const animPrompt = [sc.visualPrompt, opts.style].filter(Boolean).join(', ') || 'slow cinematic camera drift, subtle motion';
+      if (!fs.existsSync(clipPath)) await mvRestoreAsset(movie.id, 'clip' + i + '.mp4');
       if (!fs.existsSync(clipPath)) {
         movie.step = 'animate';
         await mvSave(movie);
@@ -2965,6 +2975,9 @@ async function runMoviePipeline(movie, opts) {
           await retryOnce(() => movieKenBurns(imgPath, clipPath, 5, W, H), 2000);
           out.clipSource = 'ken_burns';
         }
+        await mvSaveAsset(movie.id, 'clip' + i + '.mp4');
+      } else if (!out.clipSource) {
+        out.clipSource = 'restored'; // came from the DB mirror
       }
       out.clipUrl = assetBase + 'clip';
       movie.progress = Math.round(6 + per * (i + 0.8));
@@ -2975,9 +2988,11 @@ async function runMoviePipeline(movie, opts) {
         const narrPath = path.join(dir, 'narr' + i + '.mp3');
         movie.step = 'narration';
         await mvSave(movie);
+        if (!fs.existsSync(narrPath)) await mvRestoreAsset(movie.id, 'narr' + i + '.mp3');
         if (!fs.existsSync(narrPath)) {
           try {
             await retryOnce(() => speakText(sc.narrationText, movie.narratorVoice, opts.rate, narrPath), 2000);
+            await mvSaveAsset(movie.id, 'narr' + i + '.mp3');
           } catch (e) {
             out.narrationError = 'narration failed: ' + e.message; // scene continues silently
           }
@@ -3016,6 +3031,8 @@ async function runMoviePipeline(movie, opts) {
       burnSubtitles: opts.burnSubtitles, titleCard: opts.titleCard, crossfade: opts.crossfade,
       onProgress: (f) => { movie.progress = Math.round(82 + 13 * f); }
     });
+    await mvSaveAsset(movie.id, 'final.mp4');
+    await mvSaveAsset(movie.id, 'subtitles.vtt');
     movie.status = 'done';
     movie.progress = 100;
     movie.error = null;
@@ -3160,6 +3177,52 @@ app.get('/v1/movie/:id', async (req, res) => {
   });
 });
 
+// ---------- DB-backed asset persistence (survives restarts even without a disk) ----------
+// Every generated asset is mirrored into Postgres and restored to disk on
+// demand. Makes movie files durable on any plan (free tier included).
+const MOVIE_ASSET_MAX_BYTES = parseInt(process.env.MOVIE_ASSET_MAX_BYTES) || (64 * 1024 * 1024); // 64MB per asset
+function mvAssetKind(file) {
+  let m = /^scene(\d+)\.jpg$/.exec(file); if (m) return { kind: 'image', idx: parseInt(m[1]) };
+  m = /^clip(\d+)\.mp4$/.exec(file); if (m) return { kind: 'clip', idx: parseInt(m[1]) };
+  m = /^narr(\d+)\.mp3$/.exec(file); if (m) return { kind: 'narration', idx: parseInt(m[1]) };
+  if (file === 'final.mp4') return { kind: 'final', idx: 0 };
+  if (file === 'subtitles.vtt') return { kind: 'subtitles', idx: 0 };
+  return null;
+}
+async function mvSaveAsset(movieId, file) {
+  const k = mvAssetKind(file);
+  if (!k || !pool || dbBroken) return false;
+  try {
+    const p = path.join(MOVIE_DIR, movieId, file);
+    if (!fs.existsSync(p)) return false;
+    const st = fs.statSync(p);
+    if (st.size > MOVIE_ASSET_MAX_BYTES) { console.error('movie asset too large for DB mirror: ' + movieId + '/' + file); return false; }
+    const buf = fs.readFileSync(p);
+    await pool.query('INSERT INTO movie_assets (movie_id, kind, idx, bytes) VALUES ($1,$2,$3,$4) ON CONFLICT (movie_id, kind, idx) DO UPDATE SET bytes = EXCLUDED.bytes', [movieId, k.kind, k.idx, buf]);
+    return true;
+  } catch (e) { console.error('movie asset mirror failed (' + movieId + '/' + file + '):', e.message); return false; }
+}
+// restore an asset from the DB to disk (true if restored, false if not present)
+async function mvRestoreAsset(movieId, file) {
+  const k = mvAssetKind(file);
+  if (!k || !pool || dbBroken) return false;
+  try {
+    const r = await pool.query('SELECT bytes FROM movie_assets WHERE movie_id = $1 AND kind = $2 AND idx = $3', [movieId, k.kind, k.idx]);
+    if (!r.rowCount || !r.rows[0].bytes) return false;
+    const dir = path.join(MOVIE_DIR, movieId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, file), r.rows[0].bytes);
+    return true;
+  } catch (e) { console.error('movie asset restore failed (' + movieId + '/' + file + '):', e.message); return false; }
+}
+// ensure an asset is on disk: returns the path, restoring from the DB mirror if needed
+async function movieAssetOnDisk(movieId, file) {
+  const p = path.join(MOVIE_DIR, movieId, file);
+  if (fs.existsSync(p)) return p;
+  if (await mvRestoreAsset(movieId, file)) return p;
+  return null;
+}
+
 function movieFilePath(m, name) {
   if (!/^[\w.-]+$/.test(name)) return null;
   const p = path.join(MOVIE_DIR, m.id, name);
@@ -3171,7 +3234,7 @@ app.get('/v1/movie/:id/file', async (req, res) => {
   const m = await mvOwn(req.params.id, req.apiKey);
   if (!m) return res.status(404).json({ error: 'movie not found' });
   if (m.status !== 'done') return res.status(404).json({ error: 'movie not ready (status: ' + m.status + ')' });
-  const p = movieFilePath(m, 'final.mp4');
+  const p = await movieAssetOnDisk(m.id, 'final.mp4');
   if (!p) return res.status(404).json({ error: 'movie file missing (disk may have been recycled — rebuild from scene assets)' });
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Content-Disposition', 'attachment; filename="' + m.title.replace(/[^\w.-]+/g, '_').slice(0, 60) + '.mp4"');
@@ -3181,7 +3244,7 @@ app.get('/v1/movie/:id/file', async (req, res) => {
 app.get('/v1/movie/:id/subtitles', async (req, res) => {
   const m = await mvOwn(req.params.id, req.apiKey);
   if (!m) return res.status(404).json({ error: 'movie not found' });
-  const p = movieFilePath(m, 'subtitles.vtt');
+  const p = await movieAssetOnDisk(m.id, 'subtitles.vtt');
   if (!p) return res.status(404).json({ error: 'subtitles not ready or not found' });
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   fs.createReadStream(p).pipe(res);
@@ -3196,7 +3259,7 @@ app.get('/v1/movie/:id/scenes/:idx/:asset', async (req, res) => {
   const map = { image: { file: 'scene' + idx + '.jpg', type: 'image/jpeg' }, clip: { file: 'clip' + idx + '.mp4', type: 'video/mp4' }, narration: { file: 'narr' + idx + '.mp3', type: 'audio/mpeg' } };
   const spec = map[asset];
   if (!spec) return res.status(400).json({ error: 'asset must be image, clip, or narration' });
-  const p = movieFilePath(m, spec.file);
+  const p = await movieAssetOnDisk(m.id, spec.file);
   if (!p) return res.status(404).json({ error: spec.file + ' not found' });
   res.setHeader('Content-Type', spec.type);
   res.setHeader('Content-Disposition', 'attachment; filename="movie-' + m.id.slice(4, 12) + '-scene' + idx + '-' + asset + '.' + spec.file.split('.').pop() + '"');
@@ -3295,7 +3358,7 @@ app.delete('/v1/movie/:id', async (req, res) => {
   if (!m) return res.status(404).json({ error: 'movie not found' });
   memoryMovies.delete(m.id);
   if (pool && !dbBroken) {
-    try { await pool.query('DELETE FROM movies WHERE id = $1', [m.id]); }
+    try { await pool.query('DELETE FROM movies WHERE id = $1', [m.id]); await pool.query('DELETE FROM movie_assets WHERE movie_id = $1', [m.id]); }
     catch (e) { console.error('movie db delete failed:', e.message); }
   }
   try { fs.rmSync(path.join(MOVIE_DIR, m.id), { recursive: true, force: true }); } catch (e) {}
@@ -3424,12 +3487,13 @@ app.post('/v1/movie/:id/dub', async (req, res) => {
         const i = idxs[k];
         dub.currentScene = k + 1;
         const src = movieSceneFiles(srcDir, i), dst = movieSceneFiles(dir, k);
-        fs.copyFileSync(src.clip, dst.clip);
+        fs.copyFileSync(src.clip, dst.clip)
+        await mvSaveAsset(dub.id, 'clip' + k + '.mp4');
         if (fs.existsSync(src.img)) fs.copyFileSync(src.img, dst.img);
         const text = (translations[k] || m.scenes[i].narration || '').trim();
         dub.scenes[k].narration = text;
         if (text) {
-          try { await speakText(text, voice, rate, dst.narr); }
+          try { await speakText(text, voice, rate, dst.narr); await mvSaveAsset(dub.id, 'narr' + k + '.mp3'); }
           catch (e) { dub.scenes[k].narrationError = e.message; }
         }
         dub.progress = Math.round(6 + per * (k + 1));
@@ -3445,6 +3509,8 @@ app.post('/v1/movie/:id/dub', async (req, res) => {
         W, H, musicFile, musicVolume, burnSubtitles, titleCard, crossfade,
         onProgress: (f) => { dub.progress = Math.round(82 + 13 * f); }
       });
+      await mvSaveAsset(dub.id, 'final.mp4');
+      await mvSaveAsset(dub.id, 'subtitles.vtt');
       dub.status = 'done'; dub.progress = 100; dub.error = null;
       await mvSave(dub);
       fireMovieWebhook(dub);

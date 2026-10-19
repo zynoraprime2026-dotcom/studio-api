@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Masjid Answer Service — Studio API</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0E2A2B;color:#F3ECDA;max-width:760px;margin:0 auto;padding:32px 20px;line-height:1.65}
+h1{color:#C9A96A;margin-bottom:4px} p.sub{color:#8FB3B0;margin-top:0}
+h2{color:#C9A96A;margin:30px 0 8px;font-size:1.15rem}
+table{width:100%;border-collapse:collapse;margin:12px 0;font-size:.92rem}
+th,td{text-align:left;padding:9px;border-bottom:1px solid #1E4344;vertical-align:top}
+th{color:#C9A96A}
+code{background:#1E4344;padding:2px 8px;border-radius:4px;color:#C9A96A}
+pre{background:#122F30;border:1px solid #1E4344;border-radius:10px;padding:14px;overflow-x:auto;font-size:.8rem;color:#D8CBA8}
+pre b{color:#7BC47F} pre i{color:#6C8F8C;font-style:normal}
+a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
+.badge{display:inline-block;background:#1E4344;color:#C9A96A;border-radius:20px;padding:2px 12px;font-size:.75rem;margin:2px 4px 2px 0}
+.flow{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+.step{background:#1E4344;border-radius:10px;padding:10px 14px;font-size:.85rem;flex:1;min-width:150px}
+.step b{color:#C9A96A;display:block;font-size:.8rem}
+</style></head><body>
+<h1>🕌 Masjid Answer Service</h1>
+<p class="sub">A mosque community assistant API — announcements plus live prayer times, answered by AI in warm, simple Ghanaian English.</p>
+<p>Status: <span class="ok">Live</span> <span class="badge">x-api-key auth</span> <span class="badge">Multi-developer</span> <span class="badge">No fatwas</span></p>
+
+<h2>How it works</h2>
+<div class="flow">
+<div class="step"><b>1. Register</b>Create your mosque once and get a mosqueId.</div>
+<div class="step"><b>2. Announce</b>Post Jumu'ah times, programs, fundraisers.</div>
+<div class="step"><b>3. Answer</b>Members ask questions — the AI replies using your announcements plus live prayer times for your city.</div>
+</div>
+
+<h2>Authentication</h2>
+<p>Every request needs your Studio API key in the header. Don't have one? Get it free on the <a href="/">Studio API home page</a>.</p>
+<pre><i># every call carries your key</i>
+-H "x-api-key: YOUR_STUDIO_KEY"</pre>
+
+<h2>1. Register a mosque</h2>
+<p>Creates your mosque and returns a <code>mosqueId</code>. The mosque belongs to <b>your API key</b> — only your key can announce or answer for it.</p>
+<pre>curl -X POST https://studio-api-nqpm.onrender.com/v1/masjid/register \
+  -H "x-api-key: YOUR_STUDIO_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mosqueName": "Masjid Al-Nur",
+    "city": "Tarkwa",
+    "whatsappAdminPhone": "+233500000000"
+  }'</pre>
+<p><b>Response:</b></p>
+<pre>{
+  <b>"mosqueId"</b>: "msj_2e0c8768-...",
+  "mosqueName": "Masjid Al-Nur",
+  "city": "Tarkwa",
+  "notice": "Keep this mosqueId. Only this API key can announce or answer for it."
+}</pre>
+
+<h2>2. Store announcements</h2>
+<p>Jumu'ah khutbah times, weekly programs, fundraisers, maulid dates — up to 1000 characters. The 10 newest are used when answering.</p>
+<pre>curl -X POST https://studio-api-nqpm.onrender.com/v1/masjid/announce \
+  -H "x-api-key: YOUR_STUDIO_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mosqueId": "msj_2e0c8768-...",
+    "text": "Jumuah khutbah starts 12:30pm this week. Fundraiser for the new wudhu area after Asr on Saturday."
+  }'</pre>
+<p><b>Response:</b></p>
+<pre>{ "announcementId": "ann_f52659c2-...", "mosqueId": "msj_...", "text": "...", "created_at": "2026-10-18T06:02:00Z" }</pre>
+
+<h2>3. Answer a member's question</h2>
+<p>The member asks in plain language ("Please what time is Jumuah?"). The service fetches today's prayer times for your city from the <a href="https://ilm-api.vercel.app">Ilm API</a>, adds your stored announcements, and an AI answers briefly and warmly.</p>
+<pre>curl -X POST https://studio-api-nqpm.onrender.com/v1/masjid/answer \
+  -H "x-api-key: YOUR_STUDIO_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mosqueId": "msj_2e0c8768-...",
+    "question": "Please what time is Jumuah and is there any program this week?"
+  }'</pre>
+<p><b>Response:</b></p>
+<pre>{
+  <b>"answer"</b>: "Hello! Jumu'ah this week: the khutbah begins at 12:30 pm, and the prayer will follow right after. After Asr on Saturday, we'll have a fundraiser for the new wudhu area. May your day be blessed!",
+  "sources": {
+    "prayerTimes": { "city": "Tarkwa", "date": "2026-10-19", "times": { "fajr": "...", "dhuhr": "...", "asr": "...", "maghrib": "...", "isha": "..." } },
+    "announcementsUsed": [ { "id": "ann_...", "text": "Jumuah khutbah starts 12:30pm..." } ]
+  }
+}</pre>
+
+<h2>Limits &amp; billing</h2>
+<table>
+<tr><th>Item</th><th>Value</th></tr>
+<tr><td>Monthly free tier</td><td>100 uses per API key (shared with other Studio endpoints)</td></tr>
+<tr><td>Each <code>answer</code> call</td><td>costs <b>2 uses</b></td></tr>
+<tr><td>Rate limit</td><td>max 20 <code>answer</code> calls per hour per key</td></tr>
+<tr><td>Register &amp; announce</td><td>free (not metered)</td></tr>
+<tr><td>Check your balance</td><td><code>GET /v1/usage</code> with your key</td></tr>
+</table>
+
+<h2>Privacy between developers</h2>
+<p>Each mosque is bound to the API key that registered it. If another developer's key tries to touch your mosque — even to announce on it — they get a plain <code>404 mosque not found</code>. The system never reveals that your mosque exists.</p>
+
+<h2>Religious safety</h2>
+<p>The assistant answers community questions (times, programs, general guidance) in simple, warm English. It is <b>instructed never to issue fiqh rulings or fatwas</b> — such questions are referred to a qualified scholar or the imam.</p>
+
+<h2>Common errors</h2>
+<table>
+<tr><th>Code</th><th>Meaning</th><th>Fix</th></tr>
+<tr><td>401</td><td>missing <code>x-api-key</code></td><td>send the header with your key</td></tr>
+<tr><td>400</td><td>missing field</td><td>check <code>mosqueId</code> and the text/question</td></tr>
+<tr><td>404</td><td>mosque not found</td><td>wrong mosqueId, or the mosque belongs to another key</td></tr>
+<tr><td>429</td><td>limit reached</td><td>monthly (100) or hourly (20) — check <code>/v1/usage</code></td></tr>
+<tr><td>503</td><td>server not configured</td><td>contact the operator — server-side AI key missing</td></tr>
+</table>
+
+<h2>Full machine-readable docs</h2>
+<p><code>GET /v1/openapi.json</code> (needs your key) covers every endpoint.</p>
+<p style="margin-top:34px;padding-top:18px;border-top:1px solid #1E4344;color:#8FB3B0;font-size:.85rem">Part of the Studio API family &middot; <a href="/">Studio API home</a> &middot; <a href="https://ilm-api.vercel.app">Ilm API</a></p>
+</body></html>

@@ -10,6 +10,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 COPY server.js ./
+COPY masjid-docs.html ./
 COPY scripts/ scripts/
 COPY fonts/ fonts/
 

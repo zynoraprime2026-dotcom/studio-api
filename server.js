@@ -54,6 +54,7 @@ a{color:#C9A96A} .ok{color:#7BC47F;font-weight:bold}
 <tr><td>Image &rarr; Video</td><td><code>POST /v1/video/from-image</code></td><td>Ken Burns zoom &amp; pan effects (zoom_in, zoom_out, pan_left, pan_right, static), caption overlay</td></tr>
 <tr><td>Real Motion Video</td><td><code>POST /v1/video/image-to-video</code></td><td>True AI footage where subjects move — Kling / Hailuo / Wan via your Replicate or fal.ai key. Styles: <code>GET /v1/video/styles</code></td></tr>
 <tr><td>Multi-step Workflows</td><td><code>POST /v1/workflows</code></td><td>Chain steps (image &rarr; speech &rarr; animate); later steps reuse earlier outputs via <code>{{s1.url}}</code></td></tr>
+<tr><td>Masjid Answer Service</td><td><code>/v1/masjid/*</code></td><td>Mosque communities: register a mosque, store announcements, AI answers with live prayer times &mdash; <a href="/masjid">full masjid docs</a></td></tr>
 <tr><td>Portfolio Service</td><td><code>/v1/portfolios</code></td><td>Artist portfolios with AI-generated or uploaded artworks; publish to a shareable gallery</td></tr>
 <tr><td>Game Logic Service</td><td><code>/v1/games</code></td><td>Branching narrative projects: scenes, player choices, AI scene art, story maps</td></tr>
 <tr><td>Madrasa Classroom</td><td><code>/v1/classes</code></td><td>Teacher dashboards for the Huruuf game: classes, student rosters, per-letter progress reports</td></tr>
@@ -108,6 +109,13 @@ async function signup(){
 </script>
 </body></html>
 </body></html>`);
+});
+
+
+// ---------- Masjid Answer service docs page (no auth) ----------
+app.get('/masjid', (req, res) => {
+  try { res.send(fs.readFileSync(path.join(__dirname, 'masjid-docs.html'), 'utf8')); }
+  catch (e) { res.status(500).send('docs unavailable'); }
 });
 
 // ---------- optional Postgres (Supabase) for developer keys ----------

@@ -666,8 +666,8 @@ async function mediaSave(buf, mime, prompt) {
   return id;
 }
 
-// public media serving (no API key) — galleries embed these URLs directly
-app.get('/v1/media/:id', async (req, res) => {
+// public media serving (no API key, outside the /v1 auth gate) — galleries embed these URLs directly
+app.get('/media/:id', async (req, res) => {
   if (pool && !dbBroken) {
     try {
       const r = await pool.query('SELECT mime, bytes FROM media WHERE id = $1', [req.params.id]);
@@ -731,7 +731,7 @@ async function generateImage(opts) {
   if (cfReady) {
     const { buf, mime } = await cfGenerateImage(basePrompt, opts.seed);
     const id = await mediaSave(buf, mime, basePrompt);
-    return { url: base + '/v1/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare' };
+    return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare' };
   }
   // fallback (free, no key): Pollinations URL serves the image directly
   const params = new URLSearchParams({ width: String(w), height: String(h), nologo: 'true' });

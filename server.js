@@ -252,6 +252,16 @@ async function initDb() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS media (
+      id TEXT PRIMARY KEY,
+      key TEXT,
+      mime TEXT NOT NULL,
+      bytes BYTEA NOT NULL,
+      prompt TEXT,
+      created_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS masjid_mosques (
       id TEXT PRIMARY KEY,
       key TEXT NOT NULL,
@@ -629,24 +639,115 @@ app.get('/v1/usage', async (req, res) => {
 
 app.get('/v1/health', (req, res) => res.json({ status: 'ok', service: 'studio-api', time: new Date().toISOString() }));
 
-// ---------- image generation (free provider: Pollinations, no key needed) ----------
-app.post('/v1/image/generate', async (req, res) => {
-  const { prompt, preset, width, height, model, seed } = req.body || {};
-  let basePrompt = (typeof prompt === 'string') ? prompt : '';
+// ---------- image generation ----------
+// Primary provider: Cloudflare Workers AI (set CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN).
+// Fallback: Pollinations (free, no key) so the service still answers without credentials.
+const CF_ACCOUNT_ID = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
+const CF_API_TOKEN = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
+const CF_IMAGE_MODEL = (process.env.CLOUDFLARE_IMAGE_MODEL || '@cf/black-forest-labs/flux-1-schnell').trim();
+const cfReady = !!(CF_ACCOUNT_ID && CF_API_TOKEN);
+const memMedia = new Map(); // id -> { mime, bytes } (memory fallback when no DB)
+
+function reqBase(req) {
+  if (process.env.PUBLIC_BASE_URL) return String(process.env.PUBLIC_BASE_URL).replace(/\/+$/, '');
+  const host = (req && req.get && req.get('host')) || ('localhost:' + PORT);
+  return (String(host).indexOf('localhost') === 0 ? 'http://' : 'https://') + host;
+}
+
+async function mediaSave(buf, mime, prompt) {
+  const id = crypto.randomUUID();
+  if (pool && !dbBroken) {
+    try {
+      await pool.query('INSERT INTO media (id, key, mime, bytes, prompt, created_at) VALUES ($1,$2,$3,$4,$5,NOW())', [id, null, mime, buf, prompt || null]);
+      return id;
+    } catch (e) { console.error('media persist failed (memory fallback):', e.message); }
+  }
+  memMedia.set(id, { mime, bytes: buf });
+  return id;
+}
+
+// public media serving (no API key) — galleries embed these URLs directly
+app.get('/v1/media/:id', async (req, res) => {
+  if (pool && !dbBroken) {
+    try {
+      const r = await pool.query('SELECT mime, bytes FROM media WHERE id = $1', [req.params.id]);
+      if (r.rowCount) {
+        res.set('Content-Type', r.rows[0].mime || 'image/jpeg');
+        res.set('Cache-Control', 'public, max-age=31536000, immutable');
+        return res.send(r.rows[0].bytes);
+      }
+    } catch (e) { console.error('media get failed:', e.message); }
+  }
+  const m = memMedia.get(req.params.id);
+  if (m) { res.set('Content-Type', m.mime); res.set('Cache-Control', 'public, max-age=31536000, immutable'); return res.send(m.bytes); }
+  res.status(404).json({ error: 'media not found' });
+});
+
+// Cloudflare Workers AI: returns { buf, mime }
+async function cfGenerateImage(basePrompt, seed) {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_IMAGE_MODEL}`;
+  const body = { prompt: String(basePrompt).slice(0, 2048), steps: 4 };
+  if (seed !== undefined && seed !== null && seed !== '') {
+    const s = parseInt(seed);
+    if (Number.isFinite(s)) body.seed = s;
+  }
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + CF_API_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = (await resp.text()).slice(0, 300); } catch (e) {}
+    const err = new Error('Cloudflare Workers AI failed: ' + resp.status + ' ' + detail);
+    err.status = resp.status;
+    throw err;
+  }
+  const ct = resp.headers.get('content-type') || '';
+  if (ct.indexOf('json') !== -1) {
+    const data = await resp.json();
+    const b64 = data.image || (data.result && data.result.image);
+    if (!b64) throw new Error('Cloudflare Workers AI returned no image data');
+    return { buf: Buffer.from(b64, 'base64'), mime: 'image/jpeg' };
+  }
+  const buf = Buffer.from(await resp.arrayBuffer());
+  if (!buf.length) throw new Error('Cloudflare Workers AI returned an empty image');
+  return { buf, mime: ct || 'image/jpeg' };
+}
+
+// unified image generation — used by /v1/image/generate, workflows, portfolios, and games
+async function generateImage(opts) {
+  let basePrompt = (typeof opts.prompt === 'string') ? opts.prompt : '';
   let resolved = null;
-  if (preset) {
-    resolved = await findPreset(String(preset));
-    if (!resolved) return res.status(404).json({ error: 'preset not found: ' + preset });
+  if (opts.preset) {
+    resolved = await findPreset(String(opts.preset));
+    if (!resolved) { const e = new Error('preset not found: ' + opts.preset); e.presetNotFound = true; throw e; }
     basePrompt = basePrompt ? resolved.prompt + ', ' + basePrompt : resolved.prompt;
   }
-  if (!basePrompt) return res.status(400).json({ error: 'prompt or preset is required' });
-  const w = Math.min(Math.max(parseInt(width) || (resolved && resolved.params && resolved.params.width) || 1024, 256), 1920);
-  const h = Math.min(Math.max(parseInt(height) || (resolved && resolved.params && resolved.params.height) || 1024, 256), 1920);
+  if (!basePrompt) throw new Error('prompt or preset is required');
+  const w = Math.min(Math.max(parseInt(opts.width) || (resolved && resolved.params && resolved.params.width) || 1024, 256), 1920);
+  const h = Math.min(Math.max(parseInt(opts.height) || (resolved && resolved.params && resolved.params.height) || 1024, 256), 1920);
+  const base = (opts.baseUrl || process.env.PUBLIC_BASE_URL || ('http://localhost:' + PORT)).replace(/\/+$/, '');
+  if (cfReady) {
+    const { buf, mime } = await cfGenerateImage(basePrompt, opts.seed);
+    const id = await mediaSave(buf, mime, basePrompt);
+    return { url: base + '/v1/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare' };
+  }
+  // fallback (free, no key): Pollinations URL serves the image directly
   const params = new URLSearchParams({ width: String(w), height: String(h), nologo: 'true' });
-  if (model) params.set('model', model);
-  if (seed) params.set('seed', String(seed));
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(basePrompt)}?${params}`;
-  res.json({ url, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, note: 'URL serves the generated image directly' });
+  if (opts.model) params.set('model', String(opts.model));
+  if (opts.seed) params.set('seed', String(opts.seed));
+  return { url: `https://image.pollinations.ai/prompt/${encodeURIComponent(basePrompt)}?${params}`, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, provider: 'pollinations' };
+}
+
+app.post('/v1/image/generate', async (req, res) => {
+  const { prompt, preset, width, height, model, seed } = req.body || {};
+  try {
+    const out = await generateImage({ prompt, preset, width, height, model, seed, baseUrl: reqBase(req) });
+    res.json({ ...out, note: out.provider === 'cloudflare' ? 'Generated via Cloudflare Workers AI; URL serves the stored image' : 'URL serves the generated image directly' });
+  } catch (e) {
+    res.status(e.presetNotFound ? 404 : 400).json({ error: e.message });
+  }
 });
 
 // ---------- video rendering ----------
@@ -1273,21 +1374,10 @@ async function wfSaveDb(job) {
 }
 
 async function wfImage(p) {
-  let basePrompt = (typeof p.prompt === 'string') ? p.prompt : '';
-  let resolved = null;
-  if (p.preset) {
-    resolved = await findPreset(String(p.preset));
-    if (!resolved) throw new Error('preset not found: ' + p.preset);
-    basePrompt = basePrompt ? resolved.prompt + ', ' + basePrompt : resolved.prompt;
-  }
-  if (!basePrompt) throw new Error('image step needs prompt or preset');
-  const w = Math.min(Math.max(parseInt(p.width) || (resolved && resolved.params && resolved.params.width) || 1024, 256), 1920);
-  const h = Math.min(Math.max(parseInt(p.height) || (resolved && resolved.params && resolved.params.height) || 1024, 256), 1920);
-  const qs = new URLSearchParams({ width: String(w), height: String(h), nologo: 'true' });
-  if (p.model) qs.set('model', String(p.model));
-  if (p.seed) qs.set('seed', String(p.seed));
-  const url = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(basePrompt) + '?' + qs;
-  return { url, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h };
+  return generateImage({
+    prompt: p.prompt, preset: p.preset, width: p.width, height: p.height,
+    model: p.model, seed: p.seed, baseUrl: p.baseUrl || null
+  });
 }
 
 async function wfSpeech(p, job, dir, idx) {
@@ -1593,6 +1683,7 @@ app.post('/v1/portfolios/:id/artworks', async (req, res) => {
       preset: gen.preset || b.preset || null,
       width: gen.width || b.width, height: gen.height || b.height,
       model: gen.model || null, seed: gen.seed || b.seed || null,
+      baseUrl: reqBase(req),
     };
     try { const out = await wfImage(gp); imageUrl = out.url; prompt = out.prompt; }
     catch (e) { return res.status(400).json({ error: e.message }); }
@@ -1618,10 +1709,34 @@ app.delete('/v1/portfolios/:id/artworks/:aid', async (req, res) => {
 });
 
 // public shareable gallery — no API key required, published portfolios only
+// self-heal: when a published gallery is visited, any artwork still pointing at the
+// retired free provider is regenerated in the background (needs Cloudflare config).
+const galleryRepair = new Map(); // artwork id -> true while queued/in flight
+async function repairGalleryImages(artworks, req) {
+  if (!cfReady) return;
+  const todo = artworks.filter(a => a.image_url && a.image_url.indexOf('pollinations.ai') !== -1 && !galleryRepair.has(a.id));
+  if (!todo.length) return;
+  todo.forEach(a => galleryRepair.set(a.id, true));
+  const base = reqBase(req);
+  (async () => {
+    for (const a of todo) {
+      try {
+        const out = await generateImage({ prompt: a.prompt || a.title, baseUrl: base });
+        await awSave({ ...a, image_url: out.url });
+        console.log('gallery repair: regenerated artwork ' + a.id);
+      } catch (e) {
+        console.error('gallery repair failed for artwork ' + a.id + ':', e.message);
+        galleryRepair.delete(a.id); // allow retry on the next visit
+      }
+    }
+  })();
+}
+
 app.get('/gallery/:id', async (req, res) => {
   const p = await pfGet(req.params.id);
   if (!p || !p.published) return res.status(404).send('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:system-ui;background:#0E2A2B;color:#F3ECDA;text-align:center;padding:60px 20px"><h2>Gallery not found</h2><p style="color:#8FB3B0">This portfolio is private or does not exist.</p></body></html>');
   const artworks = await awList(p.id);
+  repairGalleryImages(artworks, req);
   const cards = artworks.map(a => `<figure style="margin:0;background:#143B3C;border:1px solid #1E4344;border-radius:12px;overflow:hidden"><img src="${a.image_url}" alt="${a.title.replace(/"/g, '&quot;')}" loading="lazy" style="width:100%;display:block;aspect-ratio:1;object-fit:cover"><figcaption style="padding:12px"><strong style="color:#F3ECDA;font-size:.95rem">${a.title}</strong>${a.description ? `<div style="color:#8FB3B0;font-size:.8rem;margin-top:4px">${a.description}</div>` : ''}</figcaption></figure>`).join('\n') || '<p style="color:#8FB3B0">No artworks yet.</p>';
   res.send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1862,7 +1977,7 @@ app.post('/v1/games/:id/scenes/:sid/assets', async (req, res) => {
   if (used >= FREE_MONTHLY_LIMIT) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT, used });
   const prompt = String(b.prompt || s.title + (s.narrative ? ' — ' + s.narrative.slice(0, 200) : ''));
   try {
-    const out = await wfImage({ prompt, preset: b.preset || null, width: b.width, height: b.height, model: b.model || null, seed: b.seed || null });
+    const out = await wfImage({ prompt, preset: b.preset || null, width: b.width, height: b.height, model: b.model || null, seed: b.seed || null, baseUrl: reqBase(req) });
     s.image_url = out.url;
     s.prompt = out.prompt;
     s.updated_at = new Date().toISOString();
@@ -2946,17 +3061,30 @@ async function runMoviePipeline(movie, opts) {
 
       // image (idempotent: a file from a previous run is reused; 3 attempts, 5s apart)
       let imageUrl = sc.imageUrl;
+      let cfPrompt = null;
       if (!imageUrl) {
         const fullPrompt = [sc.visualPrompt, opts.style, 'cinematic film still, consistent characters and setting across all scenes'].filter(Boolean).join(', ');
-        const params = new URLSearchParams({ width: String(W), height: String(H), nologo: 'true', seed: String(movieSeed) });
-        imageUrl = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(fullPrompt) + '?' + params;
+        if (cfReady) {
+          cfPrompt = fullPrompt; // Cloudflare Workers AI: bytes written directly below
+        } else {
+          const params = new URLSearchParams({ width: String(W), height: String(H), nologo: 'true', seed: String(movieSeed) });
+          imageUrl = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(fullPrompt) + '?' + params;
+        }
       }
       const imgPath = path.join(dir, 'scene' + i + '.jpg');
       movie.step = 'images';
       await mvSave(movie);
       if (!fs.existsSync(imgPath) && !(await mvRestoreAsset(movie.id, 'scene' + i + '.jpg'))) {
-        await retryAsync(() => mvFetchImage(imageUrl, imgPath), 3, 5000);
-        out.imageSourceUrl = imageUrl;
+        if (cfPrompt) {
+          await retryAsync(async () => {
+            const { buf } = await cfGenerateImage(cfPrompt, movieSeed);
+            fs.writeFileSync(imgPath, buf);
+          }, 3, 5000);
+          out.imageSourceUrl = assetBase + 'image';
+        } else {
+          await retryAsync(() => mvFetchImage(imageUrl, imgPath), 3, 5000);
+          out.imageSourceUrl = imageUrl;
+        }
       }
       await mvSaveAsset(movie.id, 'scene' + i + '.jpg');
       out.imageUrl = assetBase + 'image';

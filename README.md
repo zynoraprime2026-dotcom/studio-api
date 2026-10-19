@@ -34,6 +34,9 @@ All /v1 routes (except signup) need header: `x-api-key: <key>`
 4. Environment variables (optional but recommended):
    - `DATABASE_URL` — your Supabase Postgres connection string (persists developer keys; without it, keys are memory-only and reset on restart)
    - `JWT_SECRET` — not used by this service; skip it
+   - `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` — enables Cloudflare Workers AI image generation (recommended; Pollinations fallback is free but rate-limited and unreliable). Create the token at dash.cloudflare.com with the *Workers AI: Read* permission.
+   - `CLOUDFLARE_IMAGE_MODEL` — optional; defaults to `@cf/black-forest-labs/flux-1-schnell`
+   - `PUBLIC_BASE_URL` — public base URL of this service (recommended, e.g. https://studio-api-nqpm.onrender.com); used for image URLs when set
 5. Free tier works. Note: free tier sleeps after 15 min idle; first request wakes it (~30-60s).
 
 ## Notes

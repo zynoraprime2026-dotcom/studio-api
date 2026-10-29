@@ -720,6 +720,36 @@ app.get('/media/:id', async (req, res) => {
   res.status(404).json({ error: 'media not found' });
 });
 
+// public video serving (no API key) — the browser player needs a plain URL, and the
+// finished MP4 already lives in VIDEOS_DIR/<jobId>/output.mp4
+app.get('/media/video/:id', (req, res) => {
+  const id = String(req.params.id || '');
+  if (!/^[A-Za-z0-9-]{8,64}$/.test(id)) return res.status(400).json({ error: 'invalid video id' });
+  const file = path.join(VIDEOS_DIR, id, 'output.mp4');
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'video not ready' });
+  const stat = fs.statSync(file);
+  res.set('Content-Type', 'video/mp4');
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.set('Accept-Ranges', 'bytes');
+  const range = req.headers.range;
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    const start = m && m[1] ? parseInt(m[1], 10) : 0;
+    const end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
+    if (start >= stat.size) {
+      res.set('Content-Range', `bytes */${stat.size}`);
+      return res.status(416).end();
+    }
+    const stop = Math.min(end, stat.size - 1);
+    res.status(206);
+    res.set('Content-Range', `bytes ${start}-${stop}/${stat.size}`);
+    res.set('Content-Length', String(stop - start + 1));
+    return fs.createReadStream(file, { start, end: stop }).pipe(res);
+  }
+  res.set('Content-Length', String(stat.size));
+  return fs.createReadStream(file).pipe(res);
+});
+
 // Cloudflare Workers AI: returns { buf, mime }
 async function cfGenerateImage(basePrompt, seed) {
   const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_IMAGE_MODEL}`;

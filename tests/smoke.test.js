@@ -30,7 +30,7 @@ before(async () => {
   base = 'http://127.0.0.1:' + port;
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-api-test-'));
 
-  const env = { ...process.env, PORT: String(port), WORK_DIR: workDir, NODE_ENV: 'test' };
+  const env = { ...process.env, PORT: String(port), WORK_DIR: workDir, NODE_ENV: 'test', SIGNUP_RATE_LIMIT: '3' };
   delete env.DATABASE_URL; // keys stay in memory: no external services needed
 
   child = spawn(process.execPath, ['server.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -110,4 +110,57 @@ test('signup mints a key that unlocks /v1/health', async () => {
 test('unknown /v1 routes still require a key', async () => {
   const res = await fetch(base + '/v1/does-not-exist');
   assert.strictEqual(res.status, 401);
+});
+
+test('health reports provider readiness instead of hiding silent fallbacks', async () => {
+  const signup = await fetch(base + '/v1/developers/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'health-probe@example.com' })
+  });
+  const { key } = await signup.json();
+
+  const res = await fetch(base + '/v1/health', { headers: { 'x-api-key': key } });
+  assert.strictEqual(res.status, 200);
+  const body = await res.json();
+  assert.strictEqual(body.status, 'ok');
+  assert.ok(typeof body.uptime_seconds === 'number');
+
+  const p = body.providers;
+  assert.ok(['cloudflare', 'pollinations'].includes(p.image));
+  assert.ok(Array.isArray(p.image_to_video));
+  assert.strictEqual(typeof p.llm, 'boolean');
+  assert.strictEqual(typeof p.database, 'boolean');
+  // no keys configured in the test environment, so every degradation must be named
+  assert.ok(Array.isArray(p.degraded));
+  assert.ok(p.degraded.length > 0);
+  assert.ok(p.degraded.some((d) => d.startsWith('database:')));
+  // never leak key material
+  const raw = JSON.stringify(body);
+  for (const k of ['CLOUDFLARE_API_TOKEN', 'GROQ_API_KEY', 'DATABASE_URL=', 'FAL_KEY']) {
+    assert.ok(!raw.includes(k), 'health payload must not echo ' + k);
+  }
+});
+
+test('signup is throttled per client address', async () => {
+  // SIGNUP_RATE_LIMIT=3 in this environment; two signups already happened above.
+  const third = await fetch(base + '/v1/developers/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'throttle-3@example.com' })
+  });
+  assert.strictEqual(third.status, 200);
+
+  const fourth = await fetch(base + '/v1/developers/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'throttle-4@example.com' })
+  });
+  assert.strictEqual(fourth.status, 429);
+  const body = await fourth.json();
+  assert.match(body.error, /too many signups/i);
+  assert.strictEqual(body.limit, 3);
+
+  // a rejected signup must not mint a key
+  assert.strictEqual(body.key, undefined);
 });

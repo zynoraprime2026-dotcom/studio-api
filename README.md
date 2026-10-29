@@ -58,9 +58,35 @@ None of these are needed to boot: the service starts and serves its landing page
 | `MOVIE_MAX_SCENES` | no | `12` scenes per movie |
 | `MOVIE_ASSET_MAX_BYTES` | no | `67108864` (64MB) per mirrored asset |
 | `DUB_USAGE_COST` | no | `10` credits per dub |
+| `SIGNUP_RATE_LIMIT` | no | `5` signups per client address per window |
+| `SIGNUP_RATE_WINDOW_MS` | no | `3600000` (1 hour) throttle window for signups |
 | `JWT_SECRET` | unused | ignored by this service |
 
-Because most providers fail *down* rather than throwing, a deployment can look healthy while quietly serving lower-quality output. Compare `clipSource` (movie scenes) and the `provider` field (image responses) when verifying a deploy.
+Because most providers fail *down* rather than throwing, a deployment can look healthy while quietly serving lower-quality output. `GET /v1/health` (with a key) reports what is actually configured and lists every degradation in words:
+
+```json
+{
+  "status": "ok",
+  "service": "studio-api",
+  "uptime_seconds": 812,
+  "providers": {
+    "image": "pollinations",
+    "image_model": null,
+    "image_to_video": [],
+    "llm": false,
+    "database": false,
+    "public_base_url": null,
+    "degraded": [
+      "image: Cloudflare Workers AI not configured, using the rate-limited Pollinations fallback",
+      "image_to_video: no Replicate/fal key, scene animation falls back to Ken Burns",
+      "llm: content generation and the movie orchestrator return 503",
+      "database: developer keys are memory-only and movie assets are not mirrored"
+    ]
+  }
+}
+```
+
+`degraded` being empty means a fully configured deployment. The endpoint never echoes key values, only readiness. You can also still compare `clipSource` on movie scenes and `provider` on image responses when checking a specific render.
 
 ## Tests
 
@@ -69,7 +95,7 @@ npm install
 npm test
 ```
 
-`tests/smoke.test.js` boots the real server on a throwaway port with no database and no API keys, then asserts the auth gate (`/v1/health`, `/v1/image/generate` and unknown `/v1/*` routes reject unauthenticated calls) and the signup flow (invalid email → 400, valid email → a `studio_<48 hex>` key that unlocks `/v1/health`). It uses the built-in `node:test` runner, so there are no test dependencies and no network calls.
+`tests/smoke.test.js` boots the real server on a throwaway port with no database and no API keys, then asserts the auth gate (`/v1/health`, `/v1/image/generate` and unknown `/v1/*` routes reject unauthenticated calls), the signup flow (invalid email → 400, valid email → a `studio_<48 hex>` key that unlocks `/v1/health`), the health readiness payload (degradations named, no key material echoed) and the signup throttle (429 once the per-address limit is hit, with no key minted). It uses the built-in `node:test` runner, so there are no test dependencies and no network calls.
 
 ## Notes
 

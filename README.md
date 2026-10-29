@@ -31,18 +31,50 @@ All /v1 routes (except signup) need header: `x-api-key: <key>`
 1. Push this repo to GitHub
 2. Render -> New -> Web Service -> pick repo
 3. Runtime: *Docker*
-4. Environment variables (optional but recommended):
-   - `DATABASE_URL` — your Supabase Postgres connection string (persists developer keys; without it, keys are memory-only and reset on restart)
-   - `JWT_SECRET` — not used by this service; skip it
-   - `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` — enables Cloudflare Workers AI image generation (recommended; Pollinations fallback is free but rate-limited and unreliable). Create the token at dash.cloudflare.com with the *Workers AI: Read* permission.
-   - `CLOUDFLARE_IMAGE_MODEL` — optional; defaults to `@cf/black-forest-labs/flux-1-schnell`
-   - `PUBLIC_BASE_URL` — public base URL of this service (recommended, e.g. https://studio-api-nqpm.onrender.com); used for image URLs when set
+4. Environment variables — see [Environment variables](#environment-variables) below, or copy `.env.example`. The one that matters most is `DATABASE_URL`.
 5. Free tier works. Note: free tier sleeps after 15 min idle; first request wakes it (~30-60s).
+
+## Environment variables
+
+None of these are needed to boot: the service starts and serves its landing page with an empty environment. What changes is the *quality* of what it returns, and several gaps degrade silently rather than erroring. `.env.example` is the copy-paste version of this table.
+
+| Variable | Required | Behaviour without it |
+|---|---|---|
+| `PORT` | no | defaults to `5000` |
+| `WORK_DIR` | no | defaults to a temp directory. The Dockerfile sets `/data`; mount it to survive restarts |
+| `DATABASE_URL` | **strongly recommended** | Postgres connection string. Without it developer keys are memory-only (every restart invalidates them), usage counters reset, and the `movie_assets` mirror is unavailable — so renders are lost when an ephemeral disk is recycled |
+| `PUBLIC_BASE_URL` | recommended | used to build `/media/:id` URLs in responses; without it URLs are derived from the request host |
+| `GROQ_API_KEY` | for LLM features | `/v1/content/generate`, `/v1/movie/script` and the movie orchestrator return `503 Script generation needs GROQ_API_KEY configured on the server`. Everything else keeps working |
+| `GROQ_MODEL` | no | defaults to `openai/gpt-oss-120b` |
+| `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` | recommended | image generation silently falls back to Pollinations (free, no key, but rate-limited to roughly 1 image per 45s per IP) |
+| `CLOUDFLARE_IMAGE_MODEL` | no | defaults to `@cf/black-forest-labs/flux-1-schnell` |
+| `FAL_KEY` / `REPLICATE_API_TOKEN` | for real image-to-video | scene animation silently degrades to a Ken Burns pan/zoom on the still image. No error is raised, so check `clipSource` in the movie response if the motion looks synthetic |
+| `I2V_MODEL` | no | pins one model instead of the default provider order `kling` → `hailuo` → `wan` |
+| `ILM_API_URL` | no | defaults to `https://ilm-api.vercel.app` |
+| `ILM_API_KEY` | only if the Ilm API requires a key | prayer-time lookups go out unauthenticated |
+| `FREE_MONTHLY_LIMIT` | no | `100` metered operations per key per month |
+| `MOVIE_USAGE_COST` | no | `20` credits per movie |
+| `MOVIE_DAILY_LIMIT` | no | `3` movies (and dubs) per day |
+| `MOVIE_MAX_SCENES` | no | `12` scenes per movie |
+| `MOVIE_ASSET_MAX_BYTES` | no | `67108864` (64MB) per mirrored asset |
+| `DUB_USAGE_COST` | no | `10` credits per dub |
+| `JWT_SECRET` | unused | ignored by this service |
+
+Because most providers fail *down* rather than throwing, a deployment can look healthy while quietly serving lower-quality output. Compare `clipSource` (movie scenes) and the `provider` field (image responses) when verifying a deploy.
+
+## Tests
+
+```bash
+npm install
+npm test
+```
+
+`tests/smoke.test.js` boots the real server on a throwaway port with no database and no API keys, then asserts the auth gate (`/v1/health`, `/v1/image/generate` and unknown `/v1/*` routes reject unauthenticated calls) and the signup flow (invalid email → 400, valid email → a `studio_<48 hex>` key that unlocks `/v1/health`). It uses the built-in `node:test` runner, so there are no test dependencies and no network calls.
 
 ## Notes
 
-- Image generation uses Pollinations (free, no API key, no cost)
-- Videos are stored in `/data` (container disk). On free Render tier, disk is ephemeral — download videos promptly or wire Supabase Storage later.
+- Image generation runs on Cloudflare Workers AI (`flux-1-schnell` by default) when `CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_TOKEN` are set, and falls back to Pollinations (free, no key, rate-limited) otherwise.
+- Videos are stored in `/data` (container disk). On free Render tier, disk is ephemeral — the Postgres asset mirror restores movies after a restart when `DATABASE_URL` is set; otherwise download promptly.
 - Developer keys match the Ilm API signup pattern, but keys are per-service (studio_... vs ilm_...)
 
 ## AI Movie orchestrator
@@ -75,7 +107,7 @@ subtitle track.
 | `narratorVoice` | edge-tts voice id (e.g. `ar-SA-HamedNeural`); derived from `language` if omitted |
 | `language` | narration language for the LLM (and subtitle track tag) |
 | `aspectRatio` | `9:16` (default, Shorts) or `16:9` |
-| `musicMood` | `ambient` \| `nasheed` \| `dramatic` \| `calm` \| `upbeat` \| `none`; plays a bundled royalty-free bed from `assets/music/<mood>.mp3` (synthesized on first use — drop any royalty-free file with the same name to replace it), ducked under narration |
+| `musicMood` | `ambient` \| `nasheed` \| `dramatic` \| `calm` \| `upbeat` \| `none`; plays a royalty-free bed synthesized on first use at `<WORK_DIR>/movies/assets/music/<mood>.mp3` (generated at runtime, not committed — drop any royalty-free file at that path to replace it), ducked under narration |
 | `musicUrl` | optional; https audio file looped as a music bed, automatically ducked under narration (`musicVolume` 0.05-1, default 0.3). Overrides `musicMood` |
 | `crossfade` | default `true`; 0.5s crossfades between scenes (video and audio), subtitle timings adjust automatically |
 | `titleCard` | optional; adds a 2.5s opening card with the movie title |

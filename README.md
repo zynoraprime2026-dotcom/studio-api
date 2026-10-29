@@ -95,7 +95,7 @@ npm install
 npm test
 ```
 
-`tests/smoke.test.js` boots the real server on a throwaway port with no database and no API keys, then asserts the auth gate (`/v1/health`, `/v1/image/generate` and unknown `/v1/*` routes reject unauthenticated calls), the signup flow (invalid email → 400, valid email → a `studio_<48 hex>` key that unlocks `/v1/health`), the health readiness payload (degradations named, no key material echoed) and the signup throttle (429 once the per-address limit is hit, with no key minted). It uses the built-in `node:test` runner, so there are no test dependencies and no network calls.
+The suite is 17 assertions in two files. `tests/lib.test.js` unit-tests the two extracted modules (`lib/readiness.js` and `lib/ratelimit.js`) without booting anything. `tests/smoke.test.js` boots the real server on a throwaway port with no database and no API keys, then asserts the auth gate (`/v1/health`, `/v1/image/generate` and unknown `/v1/*` routes reject unauthenticated calls), the signup flow (invalid email → 400, valid email → a `studio_<48 hex>` key that unlocks `/v1/health`), the health readiness payload (degradations named, no key material echoed), image validation (missing prompt → 400 without spending a provider call), the usage counter shape, and the signup throttle (its own instance with a limit of 2, so 429 is deterministic and no key is minted). It uses the built-in `node:test` runner, so there are no test dependencies and no network calls.
 
 ## Notes
 

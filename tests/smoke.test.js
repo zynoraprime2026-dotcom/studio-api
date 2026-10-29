@@ -30,7 +30,7 @@ before(async () => {
   base = 'http://127.0.0.1:' + port;
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-api-test-'));
 
-  const env = { ...process.env, PORT: String(port), WORK_DIR: workDir, NODE_ENV: 'test', SIGNUP_RATE_LIMIT: '3' };
+  const env = { ...process.env, PORT: String(port), WORK_DIR: workDir, NODE_ENV: 'test', SIGNUP_RATE_LIMIT: '1000' };
   delete env.DATABASE_URL; // keys stay in memory: no external services needed
 
   child = spawn(process.execPath, ['server.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -143,24 +143,74 @@ test('health reports provider readiness instead of hiding silent fallbacks', asy
 });
 
 test('signup is throttled per client address', async () => {
-  // SIGNUP_RATE_LIMIT=3 in this environment; two signups already happened above.
-  const third = await fetch(base + '/v1/developers/signup', {
+  // Own instance so the limit is deterministic regardless of how many keys the
+  // other tests minted (they share one server process).
+  const port = await freePort();
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-api-throttle-'));
+  const env = { ...process.env, PORT: String(port), WORK_DIR: workDir, NODE_ENV: 'test', SIGNUP_RATE_LIMIT: '2' };
+  delete env.DATABASE_URL;
+  const proc = spawn(process.execPath, ['server.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('throttle instance did not start')), 20000);
+      proc.stdout.on('data', (buf) => { if (buf.toString().includes('listening on port')) { clearTimeout(timer); resolve(); } });
+      proc.once('exit', (code) => { clearTimeout(timer); reject(new Error('throttle instance exited: ' + code)); });
+    });
+
+    const url = 'http://127.0.0.1:' + port + '/v1/developers/signup';
+    const signup = (email) => fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email })
+    });
+
+    assert.strictEqual((await signup('throttle-a@example.com')).status, 200);
+    assert.strictEqual((await signup('throttle-b@example.com')).status, 200);
+
+    const blocked = await signup('throttle-c@example.com');
+    assert.strictEqual(blocked.status, 429);
+    const body = await blocked.json();
+    assert.match(body.error, /too many signups/i);
+    assert.strictEqual(body.limit, 2);
+    assert.strictEqual(body.key, undefined, 'a throttled signup must not mint a key');
+  } finally {
+    if (!proc.killed) proc.kill('SIGKILL');
+  }
+});
+
+test('image generation rejects a missing prompt without spending a provider call', async () => {
+  const signup = await fetch(base + '/v1/developers/signup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: 'throttle-3@example.com' })
+    body: JSON.stringify({ email: 'image-validation@example.com' })
   });
-  assert.strictEqual(third.status, 200);
+  const { key } = await signup.json();
 
-  const fourth = await fetch(base + '/v1/developers/signup', {
+  const res = await fetch(base + '/v1/image/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': key },
+    body: JSON.stringify({})
+  });
+  assert.strictEqual(res.status, 400);
+  const body = await res.json();
+  assert.match(body.error, /prompt/i);
+});
+
+test('usage reports the monthly counter shape', async () => {
+  const signup = await fetch(base + '/v1/developers/signup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: 'throttle-4@example.com' })
+    body: JSON.stringify({ email: 'usage-shape@example.com' })
   });
-  assert.strictEqual(fourth.status, 429);
-  const body = await fourth.json();
-  assert.match(body.error, /too many signups/i);
-  assert.strictEqual(body.limit, 3);
+  const { key } = await signup.json();
 
-  // a rejected signup must not mint a key
-  assert.strictEqual(body.key, undefined);
+  const res = await fetch(base + '/v1/usage', { headers: { 'x-api-key': key } });
+  assert.strictEqual(res.status, 200);
+  const body = await res.json();
+  assert.ok(typeof body.month === 'string');
+  assert.strictEqual(typeof body.used, 'number');
+  assert.strictEqual(typeof body.limit, 'number');
+  assert.strictEqual(typeof body.remaining, 'number');
+  assert.ok(body.remaining >= 0);
 });

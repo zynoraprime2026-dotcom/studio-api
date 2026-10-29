@@ -10,6 +10,9 @@ const os = require('os');
 const crypto = require('crypto');
 
 const execFileAsync = promisify(execFile);
+const { createSlidingWindowLimiter, clientAddress } = require('./lib/ratelimit');
+const { buildReadiness } = require('./lib/readiness');
+
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
@@ -601,36 +604,17 @@ app.get('/v1/openapi.json', (req, res) => {
 // memory (resets on restart, which is fine for an abuse brake rather than a quota).
 const SIGNUP_RATE_LIMIT = parseInt(process.env.SIGNUP_RATE_LIMIT) || 5;
 const SIGNUP_RATE_WINDOW_MS = parseInt(process.env.SIGNUP_RATE_WINDOW_MS) || 60 * 60 * 1000;
-const signupHits = new Map();
-
-function clientAddress(req) {
-  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return fwd || req.ip || 'unknown';
-}
-
-function signupRateLimited(ip) {
-  const now = Date.now();
-  const recent = (signupHits.get(ip) || []).filter((t) => now - t < SIGNUP_RATE_WINDOW_MS);
-  if (recent.length >= SIGNUP_RATE_LIMIT) {
-    signupHits.set(ip, recent);
-    return true;
-  }
-  recent.push(now);
-  signupHits.set(ip, recent);
-  if (signupHits.size > 5000) {
-    for (const [k, v] of signupHits) {
-      if (!v.some((t) => now - t < SIGNUP_RATE_WINDOW_MS)) signupHits.delete(k);
-    }
-  }
-  return false;
-}
+const signupLimiter = createSlidingWindowLimiter({
+  limit: SIGNUP_RATE_LIMIT,
+  windowMs: SIGNUP_RATE_WINDOW_MS
+});
 
 app.post('/v1/developers/signup', async (req, res) => {
   const email = (req.body && req.body.email || '').trim().toLowerCase();
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ error: 'A valid email is required' });
   }
-  if (signupRateLimited(clientAddress(req))) {
+  if (signupLimiter.isLimited(clientAddress(req))) {
     return res.status(429).json({
       error: 'Too many signups from this address. Try again later or email support.',
       limit: SIGNUP_RATE_LIMIT,
@@ -673,29 +657,16 @@ app.get('/v1/usage', async (req, res) => {
   res.json({ month, used, limit: FREE_MONTHLY_LIMIT, remaining: Math.max(0, FREE_MONTHLY_LIMIT - used) });
 });
 
-// Providers fail down silently by design (Cloudflare -> Pollinations, Replicate/fal ->
-// Ken Burns, missing DB -> memory), so this is the only place a deploy can be verified
-// without spending a paid call. Never include key values, only readiness.
-function providerReadiness() {
-  const i2v = [];
-  if (process.env.REPLICATE_API_TOKEN) i2v.push('replicate');
-  if (process.env.FAL_KEY) i2v.push('fal');
-  const degraded = [];
-  if (!cfReady) degraded.push('image: Cloudflare Workers AI not configured, using the rate-limited Pollinations fallback');
-  if (!i2v.length) degraded.push('image_to_video: no Replicate/fal key, scene animation falls back to Ken Burns');
-  if (!process.env.GROQ_API_KEY) degraded.push('llm: content generation and the movie orchestrator return 503');
-  if (!process.env.DATABASE_URL) degraded.push('database: developer keys are memory-only and movie assets are not mirrored');
-  if (!process.env.PUBLIC_BASE_URL) degraded.push('public_base_url: media links are derived from the request host');
-  return {
-    image: cfReady ? 'cloudflare' : 'pollinations',
-    image_model: cfReady ? CF_IMAGE_MODEL : null,
-    image_to_video: i2v,
-    llm: !!process.env.GROQ_API_KEY,
-    database: !!process.env.DATABASE_URL,
-    public_base_url: process.env.PUBLIC_BASE_URL || null,
-    degraded
-  };
-}
+// Providers fail down silently by design, so /v1/health reports readiness.
+const providerReadiness = () => buildReadiness({
+  imageReady: cfReady,
+  imageModel: CF_IMAGE_MODEL,
+  replicateReady: !!process.env.REPLICATE_API_TOKEN,
+  falReady: !!process.env.FAL_KEY,
+  llmReady: !!process.env.GROQ_API_KEY,
+  dbReady: !!process.env.DATABASE_URL,
+  publicBaseUrl: process.env.PUBLIC_BASE_URL || null
+});
 
 app.get('/v1/health', (req, res) => res.json({
   status: 'ok',

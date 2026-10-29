@@ -15,6 +15,7 @@ RUN npm ci --omit=dev
 
 COPY server.js ./
 COPY masjid-docs.html ./
+COPY lib/ lib/
 COPY scripts/ scripts/
 COPY fonts/ fonts/
 

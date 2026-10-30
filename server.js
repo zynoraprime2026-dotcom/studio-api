@@ -374,9 +374,17 @@ async function initDb() {
       narrator_voice TEXT,
       duration DOUBLE PRECISION,
       scenes JSONB DEFAULT '[]',
+      render JSONB,
+      continuity TEXT,
+      assembly_stale BOOLEAN DEFAULT FALSE,
+      resume_count INT DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE movies ADD COLUMN IF NOT EXISTS render JSONB;
+    ALTER TABLE movies ADD COLUMN IF NOT EXISTS continuity TEXT;
+    ALTER TABLE movies ADD COLUMN IF NOT EXISTS assembly_stale BOOLEAN DEFAULT FALSE;
+    ALTER TABLE movies ADD COLUMN IF NOT EXISTS resume_count INT DEFAULT 0;
     CREATE TABLE IF NOT EXISTS movie_assets (
       movie_id TEXT NOT NULL,
       kind TEXT NOT NULL,
@@ -2620,11 +2628,13 @@ async function mvSave(m) {
   if (pool && !dbBroken) {
     try {
       await pool.query(
-        `INSERT INTO movies (id, key, title, status, error, aspect_ratio, language, style, narrator_voice, duration, scenes, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
-         ON CONFLICT (id) DO UPDATE SET status=$4, error=$5, duration=$10, scenes=$11, updated_at=NOW()`,
+        `INSERT INTO movies (id, key, title, status, error, aspect_ratio, language, style, narrator_voice, duration, scenes, render, continuity, assembly_stale, resume_count, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
+         ON CONFLICT (id) DO UPDATE SET status=$4, error=$5, duration=$10, scenes=$11, render=$12, continuity=$13, assembly_stale=$14, resume_count=$15, updated_at=NOW()`,
         [m.id, m.key, m.title, m.status, m.error || null, m.aspect, m.language, m.style || null,
-         m.narratorVoice || null, m.duration || null, JSON.stringify(m.scenes || []), m.createdAt]);
+         m.narratorVoice || null, m.duration || null, JSON.stringify(m.scenes || []),
+         m.render ? JSON.stringify(m.render) : null, m.continuity || null,
+         m.assemblyStale === true, Number(m.resumeCount) || 0, m.createdAt]);
       return;
     } catch (e) { lastDbError = e.message; console.error('movie save failed:', e.message); }
   }
@@ -2640,6 +2650,8 @@ async function mvGetDb(id) {
       id: row.id, key: row.key, title: row.title, status: row.status, error: row.error,
       aspect: row.aspect_ratio, language: row.language, style: row.style,
       narratorVoice: row.narrator_voice, duration: row.duration, scenes: row.scenes || [],
+      render: row.render || null, continuity: row.continuity || null,
+      assemblyStale: row.assembly_stale === true, resumeCount: Number(row.resume_count) || 0,
       createdAt: row.created_at, restored: true
     };
   } catch (e) { console.error('movie db read failed:', e.message); }
@@ -3017,17 +3029,26 @@ async function resumeUnfinishedMovies() {
     console.log('movie resume: ' + r.rowCount + ' unfinished job(s), re-queueing');
     for (const row of r.rows) {
       const m = await mvGetDb(row.id);
-      if (!m || !Array.isArray(m.scenes) || !m.scenes.length) continue;
+      if (!m) continue;
+      if (!Array.isArray(m.scenes) || !m.scenes.length) {
+        // created but never started (the instance died first) and nothing to resume from
+        m.status = 'failed';
+        m.error = 'this film never started rendering and kept no shots; create it again';
+        await mvSave(m);
+        console.error('movie ' + row.id + ' had no shots to resume; marked failed');
+        continue;
+      }
       m.baseUrl = process.env.PUBLIC_BASE_URL || ('http://localhost:' + PORT);
       // a film that keeps dying on the platform must stop re-queueing forever
       m.resumeCount = (m.resumeCount || 0) + 1;
       if (m.resumeCount > 3) {
         m.status = 'failed';
         m.error = 'render kept being interrupted (the instance restarted ' + (m.resumeCount - 1) + ' times); nothing was lost, retry the film';
-        await mvSave(m);
+        await mvSave(m); // resumeCount now persists, so this film stops coming back
         console.error('movie ' + m.id + ' gave up after ' + m.resumeCount + ' resumes');
         continue;
       }
+      await mvSave(m); // persist the bump, or a crash loop would resume for ever
       m.status = 'queued'; m.step = 'images'; m.currentScene = 0; m.totalScenes = m.scenes.length; m.progress = 5;
       await mvSave(m);
       movieEnqueue('resume:' + m.id, async () => {
@@ -3039,7 +3060,7 @@ async function resumeUnfinishedMovies() {
           const ro = m.render || {};
           await runMoviePipeline(m, {
             story: null,
-            providedScenes: m.scenes.map(s => ({ ...s, image: s.imageSourceUrl || null, imageUrl: null })),
+            providedScenes: m.scenes.map(s => ({ ...s, image: s.imageSourceUrl || s.image || null, imageUrl: null })),
             language: m.language, style: m.style, rate: ro.rate || '+0%',
             W: m.aspect === '16:9' ? 1280 : 1080, H: m.aspect === '16:9' ? 720 : 1920,
             musicUrl: ro.musicUrl || null, musicVolume: ro.musicVolume, burnSubtitles: !!ro.burnSubtitles,
@@ -3629,9 +3650,19 @@ app.post('/v1/movie/create', async (req, res) => {
   res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - MOVIE_USAGE_COST));
 
   const id = 'mov_' + crypto.randomUUID();
+  // the approved shots are saved up front: if the instance dies before the first
+  // still renders, boot resume still knows what film was ordered
+  const plannedScenes = (providedScenes || []).map((sc, i) => ({
+    id: 's' + (i + 1),
+    shot: sc.shot || null,
+    visualPrompt: sc.visualPrompt || sc.visual || sc.prompt || null,
+    narrationText: sc.narrationText || sc.narration || null,
+    duration: Math.min(10, Math.max(3, Math.round(Number(sc.duration) || 5))),
+    image: sc.image || sc.imageUrl || null,
+  }));
   const movie = {
     id, key: req.apiKey, title, status: 'queued', progress: 0, error: null,
-    aspect, language, style, narratorVoice, duration: null, scenes: [], continuity,
+    aspect, language, style, narratorVoice, duration: null, scenes: plannedScenes, continuity,
     render: { musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, style, rate },
     createdAt: new Date().toISOString(),
     webhook: hook, baseUrl: 'https://' + req.get('host')

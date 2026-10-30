@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { groqChatJson, groqMovieDraft, DIRECTOR_GUARD } = require('../lib/director-llm');
+const { groqChatJson, groqMovieDraft, DIRECTOR_GUARD, NATURAL_SPEECH } = require('../lib/director-llm');
 
 function stub(replies) {
   const calls = [];
@@ -51,6 +51,9 @@ test('two calls: identity, then shots that begin with that identity', async () =
   assert.strictEqual(calls[0].body.model, 'test-model');
   assert.strictEqual(calls[0].body.response_format.type, 'json_object');
   assert.ok(calls[0].body.messages[0].content.includes(DIRECTOR_GUARD), 'the sacred-figure guard reaches the model');
+  const shotPrompt = calls[1].body.messages[0].content;
+  assert.ok(shotPrompt.includes(NATURAL_SPEECH), 'the spoken-language brief reaches the shot writer');
+  assert.ok(/contractions/i.test(shotPrompt), 'dialogue is asked for the way people talk');
   assert.ok(calls[0].body.messages[0].content.includes('dramatic'), 'moods are offered to the model');
 
   const shotSystem = calls[1].body.messages[0].content;

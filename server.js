@@ -2770,7 +2770,7 @@ async function groqMovieScenes(story, style, language, maxScenes) {
     'Reply with ONLY a JSON object of the form {"scenes":[{"id":"s1","visualPrompt":"...","narrationText":"..."}]}. ' +
     'visualPrompt: one sentence describing the action, PLUS a consistent visual description of the main characters (appearance, clothing) and the setting that is repeated in every scene so all scenes look consistent. ' +
     'NEVER depict prophets, companions of the Prophet, angels, God, or any sacred religious figures — describe such characters only as distant silhouettes with faces obscured, or replace them with calligraphy or landscape visuals. ' +
-    'narrationText: 1-2 sentences of film narration written in ' + language + '.';
+    'narrationText: SPOKEN lines, 1-2 sentences written in ' + language + ', at most 24 words. Write how people talk: contractions, plain words, uneven sentence lengths, and direct dialogue as "Name: what they say" when a character speaks. No narrator cliches, no trait stacking, no describing what the picture already shows. ';
   const messages = [{ role: 'system', content: sys }, { role: 'user', content: 'Story: ' + story + (style ? '\nOverall visual style: ' + style : '') }];
   let parsed = null, lastErr = null;
   // attempt 1: JSON mode; attempt 2 (fallback): plain completion (in case JSON mode is rejected)

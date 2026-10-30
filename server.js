@@ -3964,12 +3964,33 @@ async function seriesOwn(id, key) {
     const r = await pool.query('SELECT * FROM series WHERE id = $1 AND key = $2', [id, key]);
     if (!r.rowCount) return null;
     const row = r.rows[0];
-    return { id: row.id, key: row.key, name: row.name, bible: row.bible || '', createdAt: row.created_at };
+    return { id: row.id, key: row.key, name: row.name, bible: row.bible || '', prompt: row.prompt || null, createdAt: row.created_at };
   } catch (e) { console.error('series lookup failed:', e.message); return null; }
 }
 
 // POST /v1/series { name, bible } -> free. The bible is the look, cast and rules
 // the whole run has to obey, and it is prepended to every film made under it.
+// PATCH /v1/series/:id { name?, bible?, prompt? } -> free
+// A bible is a living document: correcting it must not mean creating a second
+// series with the same name and splitting the films between them.
+app.patch('/v1/series/:id', async (req, res) => {
+  const id = String(req.params.id || '');
+  if (!/^ser_[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error: 'that is not a series id' });
+  const own = await seriesOwn(id, req.apiKey);
+  if (!own) return res.status(404).json({ error: 'no such series' });
+  const b = req.body || {};
+  const name = b.name === undefined ? own.name : String(b.name).trim().slice(0, 80);
+  const bible = b.bible === undefined ? (own.bible || '') : String(b.bible).trim().slice(0, 2000);
+  const prompt = b.prompt === undefined ? (own.prompt || null) : (String(b.prompt).trim().slice(0, 600) || null);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  try {
+    await pool.query('UPDATE series SET name = $1, bible = $2, prompt = $3 WHERE id = $4 AND key = $5', [name, bible, prompt, id, req.apiKey]);
+    res.json({ series_id: id, name, bible, prompt, cost: 'free' });
+  } catch (e) {
+    res.status(500).json({ error: 'could not update the series: ' + e.message });
+  }
+});
+
 // POST /v1/series/suggestions { name?, bible?, prompt? } -> free, daily capped
 // A blank bible is the hardest field in the app to fill. This proposes what is
 // missing from the one you have, in lines you can tap to accept.

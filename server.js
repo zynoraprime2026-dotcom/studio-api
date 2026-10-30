@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const execFileAsync = promisify(execFile);
 const { createSlidingWindowLimiter, clientAddress } = require('./lib/ratelimit');
 const { buildReadiness } = require('./lib/readiness');
+const { normalizeContinuity, chainPlan, lastFrameArgs, isAllFallback } = require('./lib/continuity');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -701,6 +702,28 @@ async function mediaSave(buf, mime, prompt) {
   }
   memMedia.set(id, { mime, bytes: buf });
   return id;
+}
+
+// Providers fetch images by URL and send no headers, so anything handed to
+// them (a scene still, the last frame of a clip) has to be publicly readable.
+// /v1/movie/:id/scenes/:idx/image is behind the API key and 401s for them,
+// which silently pushed every scene onto the Ken Burns fallback.
+async function publishImageForProvider(buf, movieBase, prompt) {
+  const id = await mediaSave(buf, 'image/jpeg', prompt || null);
+  const base = process.env.PUBLIC_BASE_URL ? String(process.env.PUBLIC_BASE_URL).replace(/\/+$/, '') : String(movieBase || '').replace(/\/+$/, '');
+  return base + '/media/' + id;
+}
+
+// grabs the final frame of a rendered clip so the next scene can start there
+async function lastFrameOfClip(clipPath, W, H) {
+  const outPath = path.join(path.dirname(clipPath), 'lastframe-' + crypto.randomBytes(4).toString('hex') + '.jpg');
+  await execFileAsync('ffmpeg', lastFrameArgs(clipPath, outPath, W, H), { timeout: 60000 });
+  try {
+    if (!fs.existsSync(outPath)) throw new Error('ffmpeg produced no frame');
+    return fs.readFileSync(outPath);
+  } finally {
+    try { fs.unlinkSync(outPath); } catch (e) { /* best effort */ }
+  }
 }
 
 // public media serving (no API key, outside the /v1 auth gate) — galleries embed these URLs directly
@@ -3091,6 +3114,8 @@ async function runMoviePipeline(movie, opts) {
   const dir = path.join(MOVIE_DIR, movie.id);
   fs.mkdirSync(dir, { recursive: true });
   const W = opts.W, H = opts.H;
+  const continuity = normalizeContinuity(opts.continuity === undefined ? movie.continuity : opts.continuity);
+  movie.continuity = continuity;
   try {
     movie.status = 'scripting';
     movie.step = 'script';
@@ -3137,6 +3162,9 @@ async function runMoviePipeline(movie, opts) {
     });
     movie.status = 'processing';
     movie.totalScenes = movie.scenes.length;
+    const scenePlan = chainPlan(movie.scenes.length, continuity);
+    const publishedSceneImages = new Map(); // scene index -> public URL
+    let prevEndFrame = null; // public URL of the previous clip's final frame
     movie.currentScene = 0;
     movie.progress = 6;
     await mvSave(movie);
@@ -3184,15 +3212,34 @@ async function runMoviePipeline(movie, opts) {
       const clipPath = path.join(dir, 'clip' + i + '.mp4');
       const animPrompt = [sc.visualPrompt, opts.style].filter(Boolean).join(', ') || 'slow cinematic camera drift, subtle motion';
       if (!fs.existsSync(clipPath)) await mvRestoreAsset(movie.id, 'clip' + i + '.mp4');
+      // which still opens this shot: the previous clip's last frame when the
+      // film is chained, otherwise this scene's own image
+      let startImageUrl = null;
+      out.startsFrom = scenePlan[i] ? scenePlan[i].startsFrom : 'scene_image';
+      if (out.startsFrom === 'previous_clip' && prevEndFrame) startImageUrl = prevEndFrame;
+      if (!startImageUrl) {
+        if (!publishedSceneImages.has(i)) {
+          try {
+            publishedSceneImages.set(i, await publishImageForProvider(fs.readFileSync(imgPath), movie.baseUrl, sc.visualPrompt));
+          } catch (e) {
+            publishedSceneImages.set(i, null);
+            console.error('movie scene ' + i + ' could not publish its still:', e.message);
+          }
+        }
+        startImageUrl = publishedSceneImages.get(i) || out.imageSourceUrl || imageUrl;
+        out.startsFrom = 'scene_image';
+      }
       if (!fs.existsSync(clipPath)) {
         movie.step = 'animate';
         await mvSave(movie);
         if (movieI2VProviders().length) {
           try {
-            const r = await retryOnce(() => movieI2VClip(out.imageSourceUrl || imageUrl, animPrompt, 5), 3000);
+            const r = await retryOnce(() => movieI2VClip(startImageUrl, animPrompt, 5), 3000);
             await downloadVideoToDisk(r.videoUrl, clipPath);
             out.clipSource = r.model;
+            out.clipError = null;
           } catch (e) {
+            out.clipError = e.message; // surfaced in the scene, not just the log
             console.error('movie scene ' + i + ' i2v failed, using Ken Burns fallback:', e.message);
           }
         }
@@ -3203,6 +3250,16 @@ async function runMoviePipeline(movie, opts) {
         await mvSaveAsset(movie.id, 'clip' + i + '.mp4');
       } else if (!out.clipSource) {
         out.clipSource = 'restored'; // came from the DB mirror
+      }
+
+      // hand this shot's final frame to the next scene
+      prevEndFrame = null;
+      if (continuity === 'chained' && i < movie.scenes.length - 1) {
+        try {
+          prevEndFrame = await publishImageForProvider(await lastFrameOfClip(clipPath, W, H), movie.baseUrl, 'continuity frame');
+        } catch (e) {
+          console.error('movie scene ' + i + ' continuity frame failed:', e.message);
+        }
       }
       out.clipUrl = assetBase + 'clip';
       movie.progress = Math.round(6 + per * (i + 0.8));
@@ -3228,6 +3285,11 @@ async function runMoviePipeline(movie, opts) {
       movie.progress = Math.round(6 + per * (i + 1));
       await mvSave(movie);
     }
+
+    if (isAllFallback(movie.scenes)) {
+      movie.motionNote = 'no scene got provider motion (image-to-video unconfigured or failing); Ken Burns pans were used instead';
+    }
+    await mvSave(movie);
 
     // 5+6. subtitles + assembly (shared with POST /v1/movie/:id/assemble)
     movie.status = 'assembling';
@@ -3310,6 +3372,7 @@ app.post('/v1/movie/create', async (req, res) => {
   const titleCard = b.titleCard === undefined ? false : !!b.titleCard;
   const musicMood = MOVIE_MOODS.concat('none').includes(String(b.musicMood || '').trim().toLowerCase()) ? String(b.musicMood).trim().toLowerCase() : null;
   const crossfade = b.crossfade === undefined ? true : !!b.crossfade; // 0.5s crossfades between scenes
+  const continuity = normalizeContinuity(b.continuity === undefined ? 'chained' : b.continuity); // chained shots by default
 
   // daily rate limit: 3 movie creates per key per day
   const daily = await movieDailyUsed(req.apiKey);
@@ -3329,7 +3392,7 @@ app.post('/v1/movie/create', async (req, res) => {
   const id = 'mov_' + crypto.randomUUID();
   const movie = {
     id, key: req.apiKey, title, status: 'queued', progress: 0, error: null,
-    aspect, language, style, narratorVoice, duration: null, scenes: [],
+    aspect, language, style, narratorVoice, duration: null, scenes: [], continuity,
     createdAt: new Date().toISOString(),
     webhook: hook, baseUrl: 'https://' + req.get('host')
   };
@@ -3337,7 +3400,7 @@ app.post('/v1/movie/create', async (req, res) => {
   movieDailyIncr(req.apiKey);
   // sequential background worker: one movie renders at a time, the rest queue
   movieEnqueue('create:' + id, async () => {
-    try { await runMoviePipeline(movie, { story, providedScenes, language, style, rate, W, H, musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade }); }
+    try { await runMoviePipeline(movie, { story, providedScenes, language, style, rate, W, H, musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, continuity }); }
     catch (e) { console.error('movie pipeline crashed:', e.message); }
   });
   res.status(202).json({
@@ -3345,6 +3408,7 @@ app.post('/v1/movie/create', async (req, res) => {
     poll: '/v1/movie/' + id, status_url: '/v1/movie/' + id,
     video_url: '/v1/movie/' + id + '/file', subtitles_url: '/v1/movie/' + id + '/subtitles',
     scene_count_planned: providedScenes ? providedScenes.length : null,
+    continuity,
     cost: MOVIE_USAGE_COST + ' uses', daily_limit: MOVIE_DAILY_LIMIT, webhook: !!hook
   });
 });
@@ -3361,7 +3425,8 @@ app.get('/v1/movie/status/:jobId', async (req, res) => {
     jobId: m.id, state,
     progress: { currentScene: m.currentScene || null, totalScenes: m.totalScenes || (Array.isArray(m.scenes) ? m.scenes.length : null), step: m.step || null, percent: m.progress },
     videoUrl: done ? '/v1/movie/' + m.id + '/file' : null,
-    scenes: done ? (m.scenes || []).map(s => ({ imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration })) : null,
+    continuity: m.continuity || 'independent',
+    scenes: done ? (m.scenes || []).map(s => ({ imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration, clipSource: s.clipSource || null, startsFrom: s.startsFrom || null })) : null,
     error: m.error || null
   });
 });
@@ -3389,11 +3454,14 @@ app.get('/v1/movie/:id', async (req, res) => {
     subtitlesUrl: '/v1/movie/' + m.id + '/subtitles',
     duration: m.duration || null,
     language: m.language, style: m.style, aspectRatio: m.aspect, narratorVoice: m.narratorVoice,
+    continuity: m.continuity || 'independent',
     scenes: (m.scenes || []).map(s => ({
       id: s.id, imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration,
       narrationUrl: s.narrationUrl, visualPrompt: s.visualPrompt, contentGuard: s.contentGuard || null,
-      clipSource: s.clipSource, duration: s.duration, narrationError: s.narrationError || null
+      clipSource: s.clipSource, clipError: s.clipError || null, startsFrom: s.startsFrom || null,
+      duration: s.duration, narrationError: s.narrationError || null
     })),
+    motionNote: m.motionNote || null,
     subtitleNote: m.subtitleNote || null,
     musicNote: m.musicNote || null,
     step: m.step || null, currentScene: m.currentScene || null, totalScenes: m.totalScenes || (Array.isArray(m.scenes) ? m.scenes.length : null),

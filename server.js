@@ -1090,10 +1090,16 @@ const I2V_STYLES = {
 
 // Model registry: tried in order until one accepts the job (some model ids
 // change over time; 404/410/422 on one falls through to the next).
+// Slugs and input shapes are checked against each model's published Replicate
+// schema. Three things break a model silently, so get them right:
+//   1. the slug must exist (a stale slug answers 404, not 400)
+//   2. duration is an INTEGER enum, not a string
+//   3. the first frame field is named differently by every model
 const I2V_MODELS = [
-  { key: 'kling', provider: 'replicate', model: 'kwaivgi/kling-v2.5-master', build: (image, prompt, dur) => ({ image, prompt, duration: dur >= 10 ? '10' : '5' }) },
-  { key: 'hailuo', provider: 'replicate', model: 'minimax/hailuo-02', build: (image, prompt, dur) => ({ first_frame_image: image, prompt, duration: dur >= 10 ? '10' : '6' }) },
-  { key: 'wan', provider: 'replicate', model: 'wan-video/wan-2.2-i2i-fast', build: (image, prompt, dur) => ({ image, prompt, duration: dur }) },
+  { key: 'kling', provider: 'replicate', model: 'kwaivgi/kling-v2.5-turbo-pro', build: (image, prompt, dur) => ({ prompt, start_image: image, duration: dur >= 10 ? 10 : 5 }) },
+  { key: 'hailuo', provider: 'replicate', model: 'minimax/hailuo-02', build: (image, prompt, dur) => ({ prompt, first_frame_image: image, duration: dur >= 10 ? 10 : 6, resolution: dur >= 10 ? '768p' : '1080p' }) },
+  // wan has no duration input: it renders num_frames at frames_per_second (16 by default), max 121 frames
+  { key: 'wan', provider: 'replicate', model: 'wan-video/wan-2.2-i2v-fast', build: (image, prompt, dur) => ({ prompt, image, resolution: '720p', num_frames: dur >= 10 ? 121 : 81 }) },
   { key: 'kling', provider: 'fal', model: 'fal-ai/kling-video/v2.5-master/image-to-video', build: (image, prompt, dur) => ({ image_url: image, prompt, duration: dur >= 10 ? '10' : '5' }) },
   { key: 'hailuo', provider: 'fal', model: 'fal-ai/minimax/hailuo-02/standard/image-to-video', build: (image, prompt, dur) => ({ image_url: image, prompt }) },
   { key: 'wan', provider: 'fal', model: 'fal-ai/wan-i2i', build: (image, prompt, dur) => ({ image_url: image, prompt }) }
@@ -1104,15 +1110,31 @@ function i2vProviderKey(provider) {
   return provider === 'fal' ? process.env.FAL_KEY : process.env.REPLICATE_API_TOKEN;
 }
 
-async function replicateStart(entry, input) {
-  const resp = await fetch('https://api.replicate.com/v1/models/' + entry.model + '/predictions', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + process.env.REPLICATE_API_TOKEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ input })
-  });
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) { const e = new Error('replicate start failed ' + resp.status + ': ' + (body.detail || body.error || '')); e.status = resp.status; throw e; }
-  return body;
+// An account holding less than $5 of Replicate credit is throttled to 6
+// prediction creates per minute with a burst of 1, so the second model in a
+// fallback chain is answered with a 429 that says nothing about the model
+// itself. Back off and retry the same model instead of blaming it.
+async function replicateStart(entry, input, attempts = 3) {
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    const resp = await fetch('https://api.replicate.com/v1/models/' + entry.model + '/predictions', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + process.env.REPLICATE_API_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input })
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (resp.ok) return body;
+    const e = new Error('replicate start failed ' + resp.status + ': ' + (body.detail || body.error || ''));
+    e.status = resp.status;
+    lastErr = e;
+    if (resp.status !== 429 || i === attempts - 1) throw e;
+    const detail = String(body.detail || '');
+    const reset = detail.match(/resets? in ~?(\d+)s/i);
+    const waitMs = Math.min(((reset ? parseInt(reset[1], 10) : 10) + 2) * 1000, 65000);
+    console.log('replicate throttled creating a prediction, retry ' + (i + 1) + '/' + (attempts - 1) + ' in ' + Math.round(waitMs / 1000) + 's');
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+  throw lastErr;
 }
 
 async function replicatePoll(pred) {

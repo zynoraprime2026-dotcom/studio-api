@@ -2751,6 +2751,7 @@ async function mvDraftsSweep() {
 // director mode LLM plumbing lives in lib/director-llm.js so it can be tested
 // without a network; these wrappers supply the server's key, model and moods
 const { groqChatJson: groqChatJsonRaw, groqMovieDraft: groqMovieDraftRaw } = require('./lib/director-llm');
+const { spokenLine } = require('./lib/voices');
 
 function groqChatJson(messages, opts) {
   return groqChatJsonRaw(messages, Object.assign({ apiKey: process.env.GROQ_API_KEY, model: GROQ_MODEL, moods: MOVIE_MOODS }, opts));
@@ -3441,7 +3442,8 @@ async function runMoviePipeline(movie, opts) {
         if (!fs.existsSync(narrPath)) await mvRestoreAsset(movie.id, 'narr' + i + '.mp3');
         if (!fs.existsSync(narrPath)) {
           try {
-            await retryOnce(() => speakText(sc.narrationText, movie.narratorVoice, opts.rate, narrPath), 2000);
+            const cast = spokenLine(sc.narrationText, movie.narratorVoice, movie.language);
+            await retryOnce(() => speakText(cast.text, cast.voice, opts.rate, narrPath), 2000);
             await mvSaveAsset(movie.id, 'narr' + i + '.mp3');
           } catch (e) {
             out.narrationError = 'narration failed: ' + e.message; // scene continues silently
@@ -3959,7 +3961,8 @@ async function reShootScene(m, idx, patch) {
   let narrationError = null, narrDur = null;
   if (narrationText) {
     try {
-      await retryOnce(() => speakText(narrationText, m.narratorVoice, rate, f.narr), 2000);
+      const cast = spokenLine(narrationText, m.narratorVoice, m.language);
+      await retryOnce(() => speakText(cast.text, cast.voice, rate, f.narr), 2000);
       await mvSaveAsset(m.id, 'narr' + idx + '.mp3');
       try { narrDur = await mediaDuration(f.narr); } catch (e) {}
     } catch (e) { narrationError = 'narration failed: ' + e.message; }

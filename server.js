@@ -381,6 +381,13 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS series (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      bible TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
     ALTER TABLE movies ADD COLUMN IF NOT EXISTS render JSONB;
     ALTER TABLE movies ADD COLUMN IF NOT EXISTS continuity TEXT;
     ALTER TABLE movies ADD COLUMN IF NOT EXISTS assembly_stale BOOLEAN DEFAULT FALSE;
@@ -2575,6 +2582,8 @@ app.post('/v1/masjid/answer', async (req, res) => {
 // New endpoints only — existing endpoints are untouched.
 
 const MOVIE_USAGE_COST = parseInt(process.env.MOVIE_USAGE_COST) || 20;
+const MOVIE_STORYBOARD_COST = parseInt(process.env.MOVIE_STORYBOARD_COST) || 4;
+const MOVIE_HIGH_COST = parseInt(process.env.MOVIE_HIGH_COST) || 30;
 const MOVIE_DAILY_LIMIT = parseInt(process.env.MOVIE_DAILY_LIMIT) || 3;
 const MOVIE_MAX_SCENES = parseInt(process.env.MOVIE_MAX_SCENES) || 12;
 const MOVIE_DIR = path.join(WORK_DIR, 'movies'); // WORK_DIR=/data on Render (persistent disk)
@@ -2753,6 +2762,7 @@ async function mvDraftsSweep() {
 const { groqChatJson: groqChatJsonRaw, groqMovieDraft: groqMovieDraftRaw } = require('./lib/director-llm');
 const { spokenLine } = require('./lib/voices');
 const { castOf, vttToSrt, scriptCsv, scriptMarkdown, packageFor } = require('./lib/deliverables');
+const { verticalPlan, trailerPlan, trailerDuration } = require('./lib/recuts');
 
 function groqChatJson(messages, opts) {
   return groqChatJsonRaw(messages, Object.assign({ apiKey: process.env.GROQ_API_KEY, model: GROQ_MODEL, moods: MOVIE_MOODS }, opts));
@@ -3400,12 +3410,14 @@ async function runMoviePipeline(movie, opts) {
         startImageUrl = publishedSceneImages.get(i) || out.imageSourceUrl || imageUrl;
         out.startsFrom = 'scene_image';
       }
+      const tier = (movie.render && movie.render.quality) || 'standard';
       if (!fs.existsSync(clipPath)) {
         movie.step = 'animate';
         await mvSave(movie);
-        if (movieI2VProviders().length) {
+        if (movieI2VProviders().length && tier !== 'storyboard') {
           try {
-            const r = await retryOnce(() => movieI2VClip(startImageUrl, animPrompt, 5), 3000);
+            const shotSeconds = tier === 'high' ? 10 : 5;
+            const r = await retryOnce(() => movieI2VClip(startImageUrl, animPrompt, shotSeconds), 3000);
             await downloadVideoToDisk(r.videoUrl, clipPath);
             out.clipSource = r.model;
             out.clipError = null;
@@ -3417,6 +3429,7 @@ async function runMoviePipeline(movie, opts) {
         if (!out.clipSource) {
           await retryOnce(() => movieKenBurns(imgPath, clipPath, 5, W, H), 2000);
           out.clipSource = 'ken_burns';
+          if (tier === 'storyboard') out.note = 'storyboard pass: stills only, no video model was called';
         }
         await mvSaveAsset(movie.id, 'clip' + i + '.mp4');
       } else if (!out.clipSource) {
@@ -3637,6 +3650,12 @@ app.post('/v1/movie/create', async (req, res) => {
   const musicMood = MOVIE_MOODS.concat('none').includes(moodWanted) ? moodWanted : null;
   const crossfade = b.crossfade === undefined ? (sg.crossfade === undefined ? true : !!sg.crossfade) : !!b.crossfade; // 0.5s crossfades between scenes
   const continuity = normalizeContinuity(b.continuity === undefined ? (sg.continuity || 'chained') : b.continuity); // chained shots by default
+  // quality tiers: storyboard costs a fraction because it never calls a video model
+  const qualityWanted = String(b.quality || sg.quality || 'standard').trim().toLowerCase();
+  const quality = ['storyboard', 'standard', 'high'].includes(qualityWanted) ? qualityWanted : 'standard';
+  const movieCost = quality === 'storyboard' ? MOVIE_STORYBOARD_COST : (quality === 'high' ? MOVIE_HIGH_COST : MOVIE_USAGE_COST);
+  const seriesRecord = b.seriesId ? await seriesOwn(String(b.seriesId), req.apiKey) : null;
+  const look = seriesRecord && seriesRecord.bible ? (seriesRecord.bible + '. ' + style).trim().slice(0, 900) : style;
 
   // daily rate limit: 3 movie creates per key per day
   const daily = await movieDailyUsed(req.apiKey);
@@ -3646,12 +3665,12 @@ app.post('/v1/movie/create', async (req, res) => {
 
   // heavy pipeline: the whole call counts as 20 uses against the monthly limit
   const { month, used } = await getUsage(req.apiKey);
-  if (used + MOVIE_USAGE_COST > FREE_MONTHLY_LIMIT) {
-    return res.status(429).json({ error: 'Free monthly limit too low for a movie render (needs ' + MOVIE_USAGE_COST + ' uses). Email support to upgrade.', month, limit: FREE_MONTHLY_LIMIT, used, needed: MOVIE_USAGE_COST });
+  if (used + movieCost > FREE_MONTHLY_LIMIT) {
+    return res.status(429).json({ error: 'Free monthly limit too low for a movie render (needs ' + movieCost + ' uses). Email support to upgrade.', month, limit: FREE_MONTHLY_LIMIT, used, needed: movieCost });
   }
-  await addUsage(req.apiKey, MOVIE_USAGE_COST);
+  await addUsage(req.apiKey, movieCost);
   res.setHeader('X-Usage-Limit', FREE_MONTHLY_LIMIT);
-  res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - MOVIE_USAGE_COST));
+  res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - movieCost));
 
   const id = 'mov_' + crypto.randomUUID();
   // the approved shots are saved up front: if the instance dies before the first
@@ -3667,7 +3686,7 @@ app.post('/v1/movie/create', async (req, res) => {
   const movie = {
     id, key: req.apiKey, title, status: 'queued', progress: 0, error: null,
     aspect, language, style, narratorVoice, duration: null, scenes: plannedScenes, continuity,
-    render: { musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, style, rate },
+    render: { musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, style: look, rate, quality, seriesId: seriesRecord ? seriesRecord.id : null },
     createdAt: new Date().toISOString(),
     webhook: hook, baseUrl: 'https://' + req.get('host')
   };
@@ -3687,7 +3706,8 @@ app.post('/v1/movie/create', async (req, res) => {
     continuity,
     draft_id: draftRecord ? draftRecord.id : null,
     locked_look: lockedLook,
-    cost: MOVIE_USAGE_COST + ' uses', daily_limit: MOVIE_DAILY_LIMIT, webhook: !!hook
+    quality,
+    cost: movieCost + ' uses', daily_limit: MOVIE_DAILY_LIMIT, webhook: !!hook
   });
 });
 
@@ -3761,6 +3781,8 @@ function mvAssetKind(file) {
   if (file === 'final.mp4') return { kind: 'final', idx: 0 };
   if (file === 'subtitles.vtt') return { kind: 'subtitles', idx: 0 };
   if (file === 'poster.jpg') return { kind: 'poster', idx: 0 };
+  if (file === 'final-vertical.mp4') return { kind: 'final_vertical', idx: 0 };
+  if (file === 'trailer.mp4') return { kind: 'trailer', idx: 0 };
   return null;
 }
 async function mvSaveAsset(movieId, file) {
@@ -3836,6 +3858,134 @@ app.get('/v1/movie/:id/subtitles', async (req, res) => {
   fs.createReadStream(p).pipe(res);
 });
 
+// ---------- re-cuts of a finished film: 9:16 and a trailer ----------
+// Both are one ffmpeg pass over final.mp4 so the free 512MB instance survives.
+
+app.post('/v1/movie/:id/re-cut', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  if (m.status !== 'done') return res.status(409).json({ error: 'movie is not finished (status: ' + m.status + ')' });
+  const format = String((req.body || {}).format || 'vertical').toLowerCase();
+  if (format !== 'vertical') return res.status(400).json({ error: 'format must be "vertical" - a 9:16 centre crop of the finished cut' });
+  const src = await movieAssetOnDisk(m.id, 'final.mp4');
+  if (!src) return res.status(404).json({ error: 'the finished cut is not on disk - rebuild it with POST /v1/movie/' + m.id + '/assemble' });
+  if (!(await chargeUse(req.apiKey, 1))) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.' });
+  const plan = verticalPlan(m.aspect);
+  const out = path.join(MOVIE_DIR, m.id, 'final-vertical.mp4');
+  try {
+    await execFileAsync('ffmpeg', ['-y', '-i', src, '-vf', plan.filter,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-threads', '1',
+      '-c:a', 'copy', '-movflags', '+faststart', out],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 12 * 60 * 1000 });
+    await mvSaveAsset(m.id, 'final-vertical.mp4');
+    res.json({ movie_id: m.id, format: 'vertical', resolution: plan.W + 'x' + plan.H,
+      url: '/v1/movie/' + m.id + '/vertical', seconds: m.duration || null, cost: '1 use', note: plan.note || undefined });
+  } catch (e) {
+    res.status(502).json({ error: 'vertical re-cut failed: ' + e.message });
+  }
+});
+
+app.get('/v1/movie/:id/vertical', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const f = await movieAssetOnDisk(m.id, 'final-vertical.mp4');
+  if (!f) return res.status(404).json({ error: 'no vertical cut yet - POST /v1/movie/' + m.id + '/re-cut' });
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + m.title.replace(/[^\w.-]+/g, '_').slice(0, 60) + '-vertical.mp4"');
+  fs.createReadStream(f).pipe(res);
+});
+
+// POST /v1/movie/:id/trailer { shots?, seconds? } -> 1 use
+app.post('/v1/movie/:id/trailer', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  if (m.status !== 'done') return res.status(409).json({ error: 'movie is not finished (status: ' + m.status + ')' });
+  const src = await movieAssetOnDisk(m.id, 'final.mp4');
+  if (!src) return res.status(404).json({ error: 'the finished cut is not on disk - rebuild it with POST /v1/movie/' + m.id + '/assemble' });
+  const b = req.body || {};
+  const plan = trailerPlan(m.scenes, { maxShots: b.shots, seconds: b.seconds });
+  if (!plan.picks.length) return res.status(409).json({ error: plan.note || 'nothing to cut a trailer from' });
+  if (!(await chargeUse(req.apiKey, 1))) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.' });
+
+  const parts = [];
+  plan.picks.forEach((p, k) => {
+    parts.push('[0:v]trim=start=' + p.from.toFixed(2) + ':duration=' + p.seconds.toFixed(2) + ',setpts=PTS-STARTPTS,scale=960:540,setsar=1[v' + k + ']');
+    parts.push('[0:a]atrim=start=' + p.from.toFixed(2) + ':duration=' + p.seconds.toFixed(2) + ',asetpts=PTS-STARTPTS[a' + k + ']');
+  });
+  const chain = plan.picks.map((p, k) => '[v' + k + '][a' + k + ']').join('');
+  parts.push(chain + 'concat=n=' + plan.picks.length + ':v=1:a=1[v][a]');
+
+  const out = path.join(MOVIE_DIR, m.id, 'trailer.mp4');
+  try {
+    await execFileAsync('ffmpeg', ['-y', '-i', src, '-filter_complex', parts.join(';'),
+      '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-threads', '1',
+      '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 12 * 60 * 1000 });
+    await mvSaveAsset(m.id, 'trailer.mp4');
+    res.json({ movie_id: m.id, url: '/v1/movie/' + m.id + '/trailer',
+      shots: plan.picks.map((p) => p.index + 1), seconds: trailerDuration(plan.picks, false), cost: '1 use' });
+  } catch (e) {
+    res.status(502).json({ error: 'trailer cut failed: ' + e.message });
+  }
+});
+
+app.get('/v1/movie/:id/trailer', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const f = await movieAssetOnDisk(m.id, 'trailer.mp4');
+  if (!f) return res.status(404).json({ error: 'no trailer yet - POST /v1/movie/' + m.id + '/trailer' });
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + m.title.replace(/[^\w.-]+/g, '_').slice(0, 60) + '-trailer.mp4"');
+  fs.createReadStream(f).pipe(res);
+});
+
+// ---------- series bible: the look and the cast carry across films ----------
+async function seriesOwn(id, key) {
+  if (!pool || dbBroken) return null;
+  try {
+    const r = await pool.query('SELECT * FROM series WHERE id = $1 AND key = $2', [id, key]);
+    if (!r.rowCount) return null;
+    const row = r.rows[0];
+    return { id: row.id, key: row.key, name: row.name, bible: row.bible || '', createdAt: row.created_at };
+  } catch (e) { console.error('series lookup failed:', e.message); return null; }
+}
+
+// POST /v1/series { name, bible } -> free. The bible is the look, cast and rules
+// the whole run has to obey, and it is prepended to every film made under it.
+app.post('/v1/series', async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 80);
+  const bible = String(b.bible || '').trim().slice(0, 2000);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  if (!pool || dbBroken) return res.status(503).json({ error: 'series needs the database, which is not configured' });
+  const id = 'ser_' + crypto.randomUUID();
+  try {
+    await pool.query('INSERT INTO series (id, key, name, bible) VALUES ($1,$2,$3,$4)', [id, req.apiKey, name, bible]);
+    res.status(201).json({ series_id: id, name, bible, cost: 'free' });
+  } catch (e) {
+    res.status(500).json({ error: 'could not save the series: ' + e.message });
+  }
+});
+
+app.get('/v1/series', async (req, res) => {
+  if (!pool || dbBroken) return res.json({ series: [] });
+  try {
+    const r = await pool.query('SELECT id, name, bible, created_at FROM series WHERE key = $1 ORDER BY created_at DESC LIMIT 50', [req.apiKey]);
+    res.json({ series: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/v1/series/:id', async (req, res) => {
+  const sr = await seriesOwn(req.params.id, req.apiKey);
+  if (!sr) return res.status(404).json({ error: 'series not found' });
+  let films = [];
+  try {
+    const r = await pool.query("SELECT id, title, status, duration, created_at FROM movies WHERE key = $1 AND render->>'seriesId' = $2 ORDER BY created_at DESC", [req.apiKey, sr.id]);
+    films = r.rows;
+  } catch (e) { /* the bible still answers without the film list */ }
+  res.json({ id: sr.id, name: sr.name, bible: sr.bible, films });
+});
+
 // ---------- the production package: cast, script, poster ----------
 // A finished MP4 is not a deliverable. These are free to serve.
 
@@ -3866,7 +4016,17 @@ app.get('/v1/movie/:id/package', async (req, res) => {
   const m = await mvOwn(req.params.id, req.apiKey);
   if (!m) return res.status(404).json({ error: 'movie not found' });
   const poster = await movieAssetOnDisk(m.id, 'poster.jpg');
-  res.json(packageFor(m, m.baseUrl || '', !!poster));
+  const pack = packageFor(m, m.baseUrl || '', !!poster);
+  const basePath = (m.baseUrl || '') + '/v1/movie/' + m.id;
+  const vertical = await movieAssetOnDisk(m.id, 'final-vertical.mp4');
+  const trailer = await movieAssetOnDisk(m.id, 'trailer.mp4');
+  pack.deliverables.vertical = vertical ? basePath + '/vertical' : null;
+  pack.deliverables.verticalAction = vertical ? null : 'POST ' + basePath + '/re-cut {"format":"vertical"}';
+  pack.deliverables.trailer = trailer ? basePath + '/trailer' : null;
+  pack.deliverables.trailerAction = trailer ? null : 'POST ' + basePath + '/trailer';
+  pack.quality = (m.render && m.render.quality) || 'standard';
+  pack.seriesId = (m.render && m.render.seriesId) || null;
+  res.json(pack);
 });
 
 // POST /v1/movie/:id/poster -> 1 use. Portrait key art from the film's own look.

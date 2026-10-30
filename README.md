@@ -56,6 +56,9 @@ None of these are needed to boot: the service starts and serves its landing page
 | `MOVIE_USAGE_COST` | no | `20` credits per movie |
 | `MOVIE_DAILY_LIMIT` | no | `3` movies (and dubs) per day |
 | `MOVIE_MAX_SCENES` | no | `12` scenes per movie |
+| `MOVIE_DRAFT_DAILY_LIMIT` | no | `30` shot lists per key per day |
+| `MOVIE_DRAFT_TTL_HOURS` | no | `168` — how long an unrendered draft survives |
+| `MOVIE_DRAFT_COST` / `MOVIE_RESHOOT_COST` | no | `1` use each |
 | `MOVIE_ASSET_MAX_BYTES` | no | `67108864` (64MB) per mirrored asset |
 | `DUB_USAGE_COST` | no | `10` credits per dub |
 | `SIGNUP_RATE_LIMIT` | no | `5` signups per client address per window |
@@ -154,6 +157,39 @@ Responses: `202 {movie_id, status_url, ...}` — poll `GET /v1/movie/:id` until
 `{videoUrl, duration, scenes:[{id, imageUrl, clipUrl, narration, narrationUrl,
 visualPrompt, clipSource, duration, contentGuard}]}`.
 
+### Director mode: approve the shots before you pay for them
+
+`POST /v1/movie/create` will take a bare `story` and render it sight unseen, which
+is how a five minute wait turns into a film nobody asked for. The two-step path
+costs the same and lets a human fix the shots first:
+
+```bash
+# 1. prompt -> shot list. 1 use. Groq only: no Replicate, no images, no TTS.
+curl -s -X POST $API/v1/movie/draft -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt":"A boy in Mombasa finds a brass compass that points at the truth","scenes":5,"aspectRatio":"16:9"}'
+# -> { draft_id, title, logline, style_bible, scenes:[{id, shot, visualPrompt, narrationText, duration}],
+#      suggested:{aspectRatio, narratorVoice, musicMood, titleCard, burnSubtitles, crossfade, continuity}, notes:[...] }
+
+# 2. render the approved list. Same 20 uses as a normal movie. Pass the caller's
+#    edited scenes; everything else falls back to the draft's `suggested` block.
+curl -s -X POST $API/v1/movie/create -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"draft_id":"drf_...","scenes":[{"visualPrompt":"...","narrationText":"...","duration":5}]}'
+```
+
+`notes` is where the draft admits its own problems ("scene 4 narration is 34
+words; a 5s shot holds about 12"). Drafts live in `movie_drafts`, are consumed by
+a successful create, and expire after `MOVIE_DRAFT_TTL_HOURS` (default 168).
+`lockedLook: true` skips still generation and requires an `image` URL on every
+scene, for films whose stills you authored yourself.
+
+After a film exists, `GET /v1/movie/:id/suggestions` turns what the pipeline
+recorded (`clipError`, `imageError`, a missing `startsFrom`, a Ken Burns
+fallback, narration overrunning its shot, a stale cut) into ordered items that
+each carry `action: {method, path, body}`. In-progress films return an empty list:
+advice on a film that is still moving is noise. `POST /v1/movie/:id/re-shoot
+{scene}` acts on one item, and marks the existing cut stale until you call
+`assemble` again.
+
 Other routes: `GET /v1/movie/status/:jobId` (spec-shaped job status:
 `{jobId, state: queued|rendering|done|failed, progress: {currentScene,
 totalScenes, step: script|images|animate|narration|subtitles|assembly}, videoUrl,
@@ -164,7 +200,12 @@ preserved even if assembly fails — status becomes `partial` with the error),
 scenes before paying for the full 20-use render),
 `POST /v1/movie/:id/assemble` (re-assemble a partial/failed/done movie from its
 preserved assets with new options — music, title card, burned subs — no
-regeneration, 1 use), `DELETE /v1/movie/:id` (frees the persistent disk), and
+regeneration, 1 use),
+`POST /v1/movie/draft` (director mode: prompt -> editable shot list, 1 use, no
+provider spend),
+`POST /v1/movie/:id/re-shoot` (`{scene}` re-does one shot from the movie's own
+render options, 1 use), `GET /v1/movie/:id/suggestions` (free, rule-based, every
+item carries the call that fixes it), `DELETE /v1/movie/:id` (frees the persistent disk), and
 `POST /v1/movie/:id/dub` — re-narrate a finished movie in another language
 (Arabic, French, Spanish, German, Swahili, English; 10 uses): narration is
 translated by the LLM (or pass explicit `scenes:[{narrationText}]` lines to

@@ -1,0 +1,23 @@
+name: keep-warm
+
+# Render's free instance sleeps after ~15 minutes idle and then takes 40+ seconds
+# to wake, which surfaced in Tasveer Studio as a 504 on the first image request.
+# A cheap GET resets the idle timer. GitHub's scheduler is free on public repos and
+# runs whether or not anything else in this workspace is awake.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake the studio
+        run: |
+          code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 120 https://studio-api-nqpm.onrender.com/ || echo 000)
+          echo "landing page answered $code in one request"
+          if [ "$code" = "000" ]; then
+            echo "::warning::studio-api did not answer within 120s"
+          fi

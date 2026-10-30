@@ -2752,6 +2752,7 @@ async function mvDraftsSweep() {
 // without a network; these wrappers supply the server's key, model and moods
 const { groqChatJson: groqChatJsonRaw, groqMovieDraft: groqMovieDraftRaw } = require('./lib/director-llm');
 const { spokenLine } = require('./lib/voices');
+const { castOf, vttToSrt, scriptCsv, scriptMarkdown, packageFor } = require('./lib/deliverables');
 
 function groqChatJson(messages, opts) {
   return groqChatJsonRaw(messages, Object.assign({ apiKey: process.env.GROQ_API_KEY, model: GROQ_MODEL, moods: MOVIE_MOODS }, opts));
@@ -2801,6 +2802,7 @@ async function groqMovieScenes(story, style, language, maxScenes) {
 function normalizeScriptScenes(raw) {
   return (Array.isArray(raw) ? raw : []).slice(0, MOVIE_MAX_SCENES).map((s, i) => ({
     id: String((s && (s.id || s.ID)) || ('s' + (i + 1))).slice(0, 12),
+    shot: String((s && (s.shot || s.framing)) || '').trim().slice(0, 40) || null,
     visualPrompt: String((s && (s.visualPrompt || s.visual_prompt || s.prompt)) || '').trim().slice(0, 600),
     narrationText: String((s && (s.narrationText || s.narration_text || s.narration || s.text)) || '').trim().split(/\s+/).slice(0, 120).join(' ').slice(0, 600),
     imageUrl: (s && s.image && /^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1))/.test(String(s.image))) ? String(s.image) : null
@@ -3758,6 +3760,7 @@ function mvAssetKind(file) {
   m = /^narr(\d+)\.mp3$/.exec(file); if (m) return { kind: 'narration', idx: parseInt(m[1]) };
   if (file === 'final.mp4') return { kind: 'final', idx: 0 };
   if (file === 'subtitles.vtt') return { kind: 'subtitles', idx: 0 };
+  if (file === 'poster.jpg') return { kind: 'poster', idx: 0 };
   return null;
 }
 async function mvSaveAsset(movieId, file) {
@@ -3824,7 +3827,79 @@ app.get('/v1/movie/:id/subtitles', async (req, res) => {
   if (!m) return res.status(404).json({ error: 'movie not found' });
   const p = await movieAssetOnDisk(m.id, 'subtitles.vtt');
   if (!p) return res.status(404).json({ error: 'subtitles not ready or not found' });
+  if (String(req.query.format || '').toLowerCase() === 'srt') {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + m.title.replace(/[^\w.-]+/g, '_').slice(0, 60) + '.srt"');
+    return res.send(vttToSrt(fs.readFileSync(p, 'utf8')));
+  }
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+  fs.createReadStream(p).pipe(res);
+});
+
+// ---------- the production package: cast, script, poster ----------
+// A finished MP4 is not a deliverable. These are free to serve.
+
+app.get('/v1/movie/:id/cast', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const cast = castOf(m.scenes);
+  res.json({ movie_id: m.id, cast, note: cast.length ? undefined : 'no named dialogue in this film yet - write lines as "Name: what they say" to cast voices' });
+});
+
+app.get('/v1/movie/:id/script', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const fmt = String(req.query.format || 'md').toLowerCase();
+  const safe = String(m.title || 'film').replace(/[^\w.-]+/g, '_').slice(0, 60);
+  if (fmt === 'csv') {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + safe + '-shotlist.csv"');
+    return res.send(scriptCsv(m));
+  }
+  if (fmt === 'json') { const poster = await movieAssetOnDisk(m.id, 'poster.jpg'); return res.json(packageFor(m, m.baseUrl || '', !!poster)); }
+  res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + safe + '.md"');
+  res.send(scriptMarkdown(m));
+});
+
+app.get('/v1/movie/:id/package', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const poster = await movieAssetOnDisk(m.id, 'poster.jpg');
+  res.json(packageFor(m, m.baseUrl || '', !!poster));
+});
+
+// POST /v1/movie/:id/poster -> 1 use. Portrait key art from the film's own look.
+const POSTER_USAGE_COST = parseInt(process.env.POSTER_USAGE_COST) || 1;
+app.post('/v1/movie/:id/poster', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const existing = await movieAssetOnDisk(m.id, 'poster.jpg');
+  if (existing && !(req.body || {}).regenerate) return res.json({ movie_id: m.id, poster: '/v1/movie/' + m.id + '/poster', cost: '0 uses', note: 'poster already exists - pass {"regenerate":true} to replace it' });
+  if (!(await chargeUse(req.apiKey, POSTER_USAGE_COST))) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT });
+  const dir = path.join(MOVIE_DIR, m.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const lead = (m.scenes || []).map(s => s.visualPrompt || '').find(Boolean) || '';
+  const prompt = 'Cinematic movie poster key art, portrait, no text, no lettering. ' + String(m.title || '') + '. ' +
+    String(m.style || '') + '. ' + String(lead).slice(0, 300) + '. Dramatic lighting, strong single subject, room at the top for a title.';
+  const seed = movieSeedFromText(String(m.title || m.id));
+  const url = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(prompt) + '?' + new URLSearchParams({ width: '768', height: '1152', seed: String(seed), nologo: 'true', model: 'flux' }).toString();
+  try {
+    await retryOnce(() => mvFetchImage(url, path.join(dir, 'poster.jpg')), 3000);
+    await mvSaveAsset(m.id, 'poster.jpg');
+    res.json({ movie_id: m.id, poster: '/v1/movie/' + m.id + '/poster', cost: POSTER_USAGE_COST + ' use' });
+  } catch (e) {
+    res.status(502).json({ error: 'poster generation failed: ' + e.message });
+  }
+});
+
+app.get('/v1/movie/:id/poster', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const p = await movieAssetOnDisk(m.id, 'poster.jpg');
+  if (!p) return res.status(404).json({ error: 'no poster yet - POST /v1/movie/:id/poster' });
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
   fs.createReadStream(p).pipe(res);
 });
 
@@ -3875,7 +3950,7 @@ app.post('/v1/movie/script', async (req, res) => {
   await addUsage(req.apiKey, 1);
   res.setHeader('X-Usage-Remaining', Math.max(0, FREE_MONTHLY_LIMIT - used - 1));
   res.json({
-    scenes: norm.map(sc => ({ id: sc.id, visualPrompt: sc.visualPrompt, narrationText: sc.narrationText, contentGuard: sc.contentGuard || null })),
+    scenes: norm.map(sc => ({ id: sc.id, shot: sc.shot || null, visualPrompt: sc.visualPrompt, narrationText: sc.narrationText, contentGuard: sc.contentGuard || null })),
     language, suggestedVoice: movieDefaultVoice(language),
     note: 'Storyboard preview (1 use). Edit these scenes, then pass them as "scenes" to POST /v1/movie/create to render (20 uses).'
   });

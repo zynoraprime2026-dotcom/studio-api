@@ -3083,9 +3083,15 @@ async function assembleMovie(movie, dir, opts) {
     const enc = ['-r', '30', '-threads', '1', '-filter_threads', '1',
       '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '44100'];
+    const streamConcat = async () => {
+      const listPath = path.join(dir, 'list.txt');
+      fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\\''") + "'").join('\n'));
+      await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatPath], { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+    };
     let cur = segFiles[0];
     let curDur = segDurs[0];
     let prevTmp = null;
+    try {
     for (let k = 1; k < segFiles.length; k++) {
       const outPath = path.join(dir, 'xf' + k + '.mp4');
       const off = Math.max(0, curDur - overlap);
@@ -3102,6 +3108,13 @@ async function assembleMovie(movie, dir, opts) {
     }
     fs.copyFileSync(cur, concatPath);
     try { fs.unlinkSync(cur); } catch (e) {}
+    } catch (e) {
+      // a dissolve needs a re-encode; if that cannot run here, deliver hard cuts
+      // rather than no film at all
+      console.error('movie ' + movie.id + ' crossfade assembly failed, falling back to hard cuts:', e.message);
+      for (const i of included) movie.scenes[i].crossfadeError = e.message;
+      await streamConcat();
+    }
   } else {
     const listPath = path.join(dir, 'list.txt');
     fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\\''") + "'").join('\n'));

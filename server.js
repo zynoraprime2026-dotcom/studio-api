@@ -1346,7 +1346,7 @@ app.post('/v1/audio/speak', async (req, res) => {
 app.get('/v1/video/status/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'job not found' });
-  res.json({ status: job.status, progress: job.progress, error: job.error, video_url: job.status === 'done' ? `/v1/video/file/${job.videoId}` : null });
+  res.json({ status: job.status, progress: job.progress, error: job.error, model: job.model || null, video_url: job.status === 'done' ? `/v1/video/file/${job.videoId}` : null });
 });
 
 app.get('/v1/video/file/:id', (req, res) => {

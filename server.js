@@ -684,6 +684,7 @@ const CF_ACCOUNT_ID = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
 const CF_API_TOKEN = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
 const CF_IMAGE_MODEL = (process.env.CLOUDFLARE_IMAGE_MODEL || '@cf/black-forest-labs/flux-1-schnell').trim();
 const cfReady = !!(CF_ACCOUNT_ID && CF_API_TOKEN);
+let cfSeedAccepted = true; // flipped off the first time Cloudflare rejects the seed property
 const memMedia = new Map(); // id -> { mime, bytes } (memory fallback when no DB)
 
 function reqBase(req) {
@@ -776,16 +777,27 @@ app.get('/media/video/:id', (req, res) => {
 // Cloudflare Workers AI: returns { buf, mime }
 async function cfGenerateImage(basePrompt, seed) {
   const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_IMAGE_MODEL}`;
-  const body = { prompt: String(basePrompt).slice(0, 2048), steps: 4 };
-  if (seed !== undefined && seed !== null && seed !== '') {
-    const s = parseInt(seed);
-    if (Number.isFinite(s)) body.seed = s;
+  const seedNum = (seed !== undefined && seed !== null && seed !== '' && Number.isFinite(parseInt(seed))) ? parseInt(seed) : null;
+  const call = async (withSeed) => {
+    const body = { prompt: String(basePrompt).slice(0, 2048), steps: 4 };
+    if (withSeed && seedNum !== null) body.seed = seedNum;
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + CF_API_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  };
+  let resp = await call(cfSeedAccepted && seedNum !== null);
+  // flux-1-schnell used to take a seed for cross-scene consistency and then
+  // started rejecting the property outright ("/seed at '/' not allowed"), which
+  // failed every scene image and left whole films `partial`. Probe once, then stop sending it.
+  if (!resp.ok && resp.status === 400 && cfSeedAccepted && seedNum !== null) {
+    const probe = await resp.clone().text().catch(() => '');
+    if (/seed/i.test(probe)) {
+      cfSeedAccepted = false;
+      resp = await call(false);
+    }
   }
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + CF_API_TOKEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
   if (!resp.ok) {
     let detail = '';
     try { detail = (await resp.text()).slice(0, 300); } catch (e) {}
@@ -2924,11 +2936,19 @@ async function resumeUnfinishedMovies() {
       await mvSave(m);
       movieEnqueue('resume:' + m.id, async () => {
         try {
+          // reuse the stills that already rendered (imageSourceUrl is public and
+          // still fetchable) and replay the original render options, so a resumed
+          // film keeps its music, captions and chained shots instead of quietly
+          // coming back plainer than the one that was ordered.
+          const ro = m.render || {};
           await runMoviePipeline(m, {
             story: null,
-            providedScenes: m.scenes.map(s => ({ ...s, imageUrl: null })), // missing images re-generate with the stored prompts
-            language: m.language, style: m.style, rate: '+0%',
+            providedScenes: m.scenes.map(s => ({ ...s, image: s.imageSourceUrl || null, imageUrl: null })),
+            language: m.language, style: m.style, rate: ro.rate || '+0%',
             W: m.aspect === '16:9' ? 1280 : 1080, H: m.aspect === '16:9' ? 720 : 1920,
+            musicUrl: ro.musicUrl || null, musicVolume: ro.musicVolume, burnSubtitles: !!ro.burnSubtitles,
+            titleCard: !!ro.titleCard, musicMood: ro.musicMood || null, crossfade: ro.crossfade !== false,
+            continuity: m.continuity || 'chained',
             resume: true
           });
         } catch (e) { console.error('movie resume failed (' + m.id + '):', e.message); }
@@ -3192,15 +3212,25 @@ async function runMoviePipeline(movie, opts) {
       movie.step = 'images';
       await mvSave(movie);
       if (!fs.existsSync(imgPath) && !(await mvRestoreAsset(movie.id, 'scene' + i + '.jpg'))) {
-        if (cfPrompt) {
-          await retryAsync(async () => {
-            const { buf } = await cfGenerateImage(cfPrompt, movieSeed);
-            fs.writeFileSync(imgPath, buf);
-          }, 3, 5000);
-          out.imageSourceUrl = assetBase + 'image';
-        } else {
-          await retryAsync(() => mvFetchImage(imageUrl, imgPath), 3, 5000);
-          out.imageSourceUrl = imageUrl;
+        try {
+          if (cfPrompt) {
+            await retryAsync(async () => {
+              const { buf } = await cfGenerateImage(cfPrompt, movieSeed);
+              fs.writeFileSync(imgPath, buf);
+            }, 3, 5000);
+            out.imageSourceUrl = assetBase + 'image';
+          } else {
+            await retryAsync(() => mvFetchImage(imageUrl, imgPath), 3, 5000);
+            out.imageSourceUrl = imageUrl;
+          }
+        } catch (e) {
+          // one bad still should cost one scene, not the whole film
+          out.imageError = e.message;
+          console.error('movie scene ' + i + ' image failed, dropping the scene:', e.message);
+          movie.currentScene = i + 1;
+          movie.progress = Math.round(6 + per * (i + 1));
+          await mvSave(movie);
+          continue;
         }
       }
       await mvSaveAsset(movie.id, 'scene' + i + '.jpg');
@@ -3393,6 +3423,7 @@ app.post('/v1/movie/create', async (req, res) => {
   const movie = {
     id, key: req.apiKey, title, status: 'queued', progress: 0, error: null,
     aspect, language, style, narratorVoice, duration: null, scenes: [], continuity,
+    render: { musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, style, rate },
     createdAt: new Date().toISOString(),
     webhook: hook, baseUrl: 'https://' + req.get('host')
   };
@@ -3458,7 +3489,7 @@ app.get('/v1/movie/:id', async (req, res) => {
     scenes: (m.scenes || []).map(s => ({
       id: s.id, imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration,
       narrationUrl: s.narrationUrl, visualPrompt: s.visualPrompt, contentGuard: s.contentGuard || null,
-      clipSource: s.clipSource, clipError: s.clipError || null, startsFrom: s.startsFrom || null,
+      clipSource: s.clipSource, clipError: s.clipError || null, startsFrom: s.startsFrom || null, imageError: s.imageError || null,
       duration: s.duration, narrationError: s.narrationError || null
     })),
     motionNote: m.motionNote || null,

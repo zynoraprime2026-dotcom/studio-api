@@ -2932,6 +2932,15 @@ async function resumeUnfinishedMovies() {
       const m = await mvGetDb(row.id);
       if (!m || !Array.isArray(m.scenes) || !m.scenes.length) continue;
       m.baseUrl = process.env.PUBLIC_BASE_URL || ('http://localhost:' + PORT);
+      // a film that keeps dying on the platform must stop re-queueing forever
+      m.resumeCount = (m.resumeCount || 0) + 1;
+      if (m.resumeCount > 3) {
+        m.status = 'failed';
+        m.error = 'render kept being interrupted (the instance restarted ' + (m.resumeCount - 1) + ' times); nothing was lost, retry the film';
+        await mvSave(m);
+        console.error('movie ' + m.id + ' gave up after ' + m.resumeCount + ' resumes');
+        continue;
+      }
       m.status = 'queued'; m.step = 'images'; m.currentScene = 0; m.totalScenes = m.scenes.length; m.progress = 5;
       await mvSave(m);
       movieEnqueue('resume:' + m.id, async () => {
@@ -3065,26 +3074,34 @@ async function assembleMovie(movie, dir, opts) {
 
   let concatPath = path.join(dir, 'concat.mp4');
   if (overlap) {
-    // 0.5s crossfades between segments (video xfade + audio acrossfade)
-    const args = ['-y'];
-    for (const f of segFiles) args.push('-i', f);
-    const n = segFiles.length;
-    // per-segment durations (title card first if present) -> xfade offsets in the output timeline
+    // 0.5s crossfades between segments (video xfade + audio acrossfade).
+    // Folded pairwise: one xfade at a time, so only two streams are ever decoded.
+    // The single graph that took every segment at once needed all of them decoded
+    // simultaneously, which restarted the whole free Render instance mid-assembly
+    // on a five scene film and left it looping resume -> OOM -> resume.
     const segDurs = (opts.titleCard ? [2.5] : []).concat(included.map(i => movie.scenes[i].duration || 5));
-    const fcParts = [];
-    let vLast = '0:v', aLast = '0:a';
-    for (let k = 1; k < n; k++) {
-      const off = Math.max(0, segDurs.slice(0, k).reduce((a, b) => a + b, 0) - overlap * k);
-      const vOut = 'vx' + k, aOut = 'ax' + k;
-      fcParts.push('[' + vLast + '][' + k + ':v]xfade=transition=fade:duration=0.5:offset=' + off.toFixed(3) + '[' + vOut + ']');
-      fcParts.push('[' + aLast + '][' + k + ':a]acrossfade=d=0.5[' + aOut + ']');
-      vLast = vOut; aLast = aOut;
-    }
-    args.push('-filter_complex', fcParts.join(';'), '-map', '[' + vLast + ']', '-map', '[' + aLast + ']',
-      '-r', '30', '-threads', '1', '-filter_threads', '1',
+    const enc = ['-r', '30', '-threads', '1', '-filter_threads', '1',
       '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
-      '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', concatPath);
-    await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 15 * 60 * 1000 });
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '44100'];
+    let cur = segFiles[0];
+    let curDur = segDurs[0];
+    let prevTmp = null;
+    for (let k = 1; k < segFiles.length; k++) {
+      const outPath = path.join(dir, 'xf' + k + '.mp4');
+      const off = Math.max(0, curDur - overlap);
+      const fc = '[0:v][1:v]xfade=transition=fade:duration=' + overlap + ':offset=' + off.toFixed(3) + '[v];' +
+        '[0:a][1:a]acrossfade=d=' + overlap + '[a]';
+      await execFileAsync('ffmpeg', ['-y', '-i', cur, '-i', segFiles[k], '-filter_complex', fc,
+        '-map', '[v]', '-map', '[a]'].concat(enc, [outPath]),
+        { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+      curDur = curDur + segDurs[k] - overlap;
+      if (prevTmp) { try { fs.unlinkSync(prevTmp); } catch (e) {} }
+      prevTmp = outPath;
+      cur = outPath;
+      if (opts.onProgress) opts.onProgress(0.75 + 0.2 * (k / Math.max(1, segFiles.length - 1)));
+    }
+    fs.copyFileSync(cur, concatPath);
+    try { fs.unlinkSync(cur); } catch (e) {}
   } else {
     const listPath = path.join(dir, 'list.txt');
     fs.writeFileSync(listPath, segFiles.map(f => "file '" + f.replace(/'/g, "'\\''") + "'").join('\n'));

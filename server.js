@@ -678,7 +678,9 @@ app.use('/v1', async (req, res, next) => {
 
 app.get('/v1/usage', async (req, res) => {
   const { month, used } = await getUsage(req.headers['x-api-key'] || '');
-  res.json({ month, used, limit: FREE_MONTHLY_LIMIT, remaining: Math.max(0, FREE_MONTHLY_LIMIT - used) });
+  res.json({ month, used, limit: FREE_MONTHLY_LIMIT, remaining: Math.max(0, FREE_MONTHLY_LIMIT - used),
+    movie_costs: { storyboard: MOVIE_STORYBOARD_COST, standard: MOVIE_USAGE_COST, high: MOVIE_HIGH_COST },
+    draft_cost: MOVIE_DRAFT_COST });
 });
 
 // Providers fail down silently by design, so /v1/health reports readiness.
@@ -3549,7 +3551,11 @@ app.post('/v1/movie/draft', async (req, res) => {
   const ar = String(b.aspectRatio || b.aspect || '9:16').toLowerCase();
   const aspect = (ar === '16:9' || ar === 'wide' || ar === 'landscape' || ar === 'widescreen') ? '16:9' : '9:16';
   const language = String(b.language || 'English').trim().slice(0, 40);
-  const style = String(b.style || '').trim().slice(0, 300);
+  const seriesDraft = b.seriesId ? await seriesOwn(String(b.seriesId), req.apiKey) : null;
+  const styleInput = String(b.style || '').trim().slice(0, 300);
+  const style = seriesDraft && seriesDraft.bible
+    ? (seriesDraft.bible + '. ' + styleInput).trim().slice(0, 900)
+    : styleInput;
   const character = String(b.character || '').trim().slice(0, 300);
   const duration = clampDuration(b.duration, 5);
   const wanted = parseInt(b.scenes, 10);
@@ -3589,6 +3595,7 @@ app.post('/v1/movie/draft', async (req, res) => {
     continuity: 'chained',
     narrationRate: '+0%'
   };
+  if (seriesDraft) draft.seriesId = seriesDraft.id;
   await mvDraftSave({ id, key: req.apiKey, prompt, language, draft: Object.assign({}, draft, { suggested }), createdAt: new Date().toISOString() });
 
   res.json({
@@ -3603,6 +3610,7 @@ app.post('/v1/movie/draft', async (req, res) => {
     notes: draft.notes,
     language,
     duration_per_scene: duration,
+    series_id: seriesDraft ? seriesDraft.id : null,
     cost: MOVIE_DRAFT_COST + ' use',
     next: 'review and edit the shots, then POST /v1/movie/create with { draft_id, scenes }'
   });

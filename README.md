@@ -135,9 +135,18 @@ subtitle track.
 | `aspectRatio` | `9:16` (default, Shorts) or `16:9` |
 | `musicMood` | `ambient` \| `nasheed` \| `dramatic` \| `calm` \| `upbeat` \| `none`; plays a royalty-free bed synthesized on first use at `<WORK_DIR>/movies/assets/music/<mood>.mp3` (generated at runtime, not committed — drop any royalty-free file at that path to replace it), ducked under narration |
 | `musicUrl` | optional; https audio file looped as a music bed, automatically ducked under narration (`musicVolume` 0.05-1, default 0.3). Overrides `musicMood` |
+| `continuity` | default `chained`: every scene after the first opens on the **last frame of the previous clip**, so the film flows instead of cutting between unrelated shots. `independent` keeps each shot starting on its own still. Reported back per scene as `startsFrom` (`previous_clip` \| `scene_image`) |
 | `crossfade` | default `true`; 0.5s crossfades between scenes (video and audio), subtitle timings adjust automatically |
 | `titleCard` | optional; adds a 2.5s opening card with the movie title |
 | `burnSubtitles` | optional; burns captions into the picture for players that ignore soft subtitle tracks (WhatsApp). Latin scripts only — use soft subs + VTT for Arabic |
+
+Scene stills and continuity frames are handed to the video provider as **public**
+`/media/<id>` URLs, because Replicate/fal fetch them without headers and the
+`/v1/...` routes require `x-api-key`. Set `PUBLIC_BASE_URL` when the service sits
+behind a proxy so those URLs resolve to the public host. Each scene reports
+`clipSource` (the winning `provider:model`, `ken_burns`, or `restored`) and
+`clipError` when real motion failed, and a film that got no provider motion at
+all also carries a movie-level `motionNote`.
 | `webhook` | optional; POSTs `movie.completed` / `movie.failed` with the final payload |
 
 Responses: `202 {movie_id, status_url, ...}` — poll `GET /v1/movie/:id` until

@@ -3873,7 +3873,7 @@ app.post('/v1/movie/:id/re-cut', async (req, res) => {
   const plan = verticalPlan(m.aspect);
   const out = path.join(MOVIE_DIR, m.id, 'final-vertical.mp4');
   try {
-    await execFileAsync('ffmpeg', ['-y', '-i', src, '-vf', plan.filter,
+    await execFileAsync('ffmpeg', ['-y', '-i', src, '-vf', plan.filter, '-filter_threads', '1',
       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-threads', '1',
       '-c:a', 'copy', '-movflags', '+faststart', out],
       { maxBuffer: 1024 * 1024 * 10, timeout: 12 * 60 * 1000 });
@@ -3907,20 +3907,29 @@ app.post('/v1/movie/:id/trailer', async (req, res) => {
   if (!plan.picks.length) return res.status(409).json({ error: plan.note || 'nothing to cut a trailer from' });
   if (!(await chargeUse(req.apiKey, 1))) return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.' });
 
+  // One decode of the whole film with three trims in a single filtergraph blew the
+  // 512MB instance. Each pick is pulled out on its own instead, then the parts are
+  // joined with a stream copy, which decodes nothing.
+  const dir = path.join(MOVIE_DIR, m.id);
   const parts = [];
-  plan.picks.forEach((p, k) => {
-    parts.push('[0:v]trim=start=' + p.from.toFixed(2) + ':duration=' + p.seconds.toFixed(2) + ',setpts=PTS-STARTPTS,scale=960:540,setsar=1[v' + k + ']');
-    parts.push('[0:a]atrim=start=' + p.from.toFixed(2) + ':duration=' + p.seconds.toFixed(2) + ',asetpts=PTS-STARTPTS[a' + k + ']');
-  });
-  const chain = plan.picks.map((p, k) => '[v' + k + '][a' + k + ']').join('');
-  parts.push(chain + 'concat=n=' + plan.picks.length + ':v=1:a=1[v][a]');
-
-  const out = path.join(MOVIE_DIR, m.id, 'trailer.mp4');
   try {
-    await execFileAsync('ffmpeg', ['-y', '-i', src, '-filter_complex', parts.join(';'),
-      '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-threads', '1',
-      '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out],
-      { maxBuffer: 1024 * 1024 * 10, timeout: 12 * 60 * 1000 });
+    for (let k = 0; k < plan.picks.length; k++) {
+      const p = plan.picks[k];
+      const part = path.join(dir, 'trailer-part' + k + '.mp4');
+      await execFileAsync('ffmpeg', ['-y', '-ss', p.from.toFixed(2), '-t', p.seconds.toFixed(2), '-i', src,
+        '-vf', 'scale=960:540,setsar=1', '-filter_threads', '1',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-threads', '1',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', part],
+        { maxBuffer: 1024 * 1024 * 10, timeout: 6 * 60 * 1000 });
+      parts.push(part);
+    }
+    const listFile = path.join(dir, 'trailer-list.txt');
+    fs.writeFileSync(listFile, parts.map((f) => "file '" + f + "'").join('\n'));
+    const out = path.join(dir, 'trailer.mp4');
+    await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile,
+      '-c', 'copy', '-movflags', '+faststart', out],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 6 * 60 * 1000 });
+    for (const f of parts.concat([listFile])) { try { fs.unlinkSync(f); } catch (e) {} }
     await mvSaveAsset(m.id, 'trailer.mp4');
     res.json({ movie_id: m.id, url: '/v1/movie/' + m.id + '/trailer',
       shots: plan.picks.map((p) => p.index + 1), seconds: trailerDuration(plan.picks, false), cost: '1 use' });

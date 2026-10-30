@@ -392,6 +392,7 @@ async function initDb() {
     ALTER TABLE movies ADD COLUMN IF NOT EXISTS continuity TEXT;
     ALTER TABLE movies ADD COLUMN IF NOT EXISTS assembly_stale BOOLEAN DEFAULT FALSE;
     ALTER TABLE movies ADD COLUMN IF NOT EXISTS resume_count INT DEFAULT 0;
+    ALTER TABLE series ADD COLUMN IF NOT EXISTS prompt TEXT;
     CREATE TABLE IF NOT EXISTS movie_assets (
       movie_id TEXT NOT NULL,
       kind TEXT NOT NULL,
@@ -3969,16 +3970,66 @@ async function seriesOwn(id, key) {
 
 // POST /v1/series { name, bible } -> free. The bible is the look, cast and rules
 // the whole run has to obey, and it is prepended to every film made under it.
+// POST /v1/series/suggestions { name?, bible?, prompt? } -> free, daily capped
+// A blank bible is the hardest field in the app to fill. This proposes what is
+// missing from the one you have, in lines you can tap to accept.
+const BIBLE_SYSTEM = 'You help a director fill in a series bible for a small AI film studio that renders short films ' +
+  'from stills and moving shots with a spoken voice-over. Reply with ONLY a JSON object: ' +
+  '{"suggestions":[{"label":"...","text":"..."}]}. Exactly three suggestions. ' +
+  'Each label is at most four words and names what it adds (the cast, the light, the rules, the camera, the sound). ' +
+  'Each text is plain prose, between 120 and 320 characters, written to be appended to the bible as-is: ' +
+  'no preamble, no bullet points, no quotation marks, no "you could" hedging. ' +
+  'Suggest only what the bible below is missing or leaves vague. Never restate what is already there. ' +
+  'Be concrete: name people, colours, lenses, rules. Vague taste words are useless to a renderer.';
+
+app.post('/v1/series/suggestions', async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 80);
+  const bible = String(b.bible || '').trim().slice(0, 2000);
+  const prompt = String(b.prompt || '').trim().slice(0, 600);
+  if (!name && !bible && !prompt) return res.status(400).json({ error: 'Write a name, an idea or a line of the bible first.' });
+  if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'suggestions need GROQ_API_KEY on the server' });
+
+  const daily = await mvDraftDailyUsed(req.apiKey);
+  if (daily.count >= MOVIE_DRAFT_DAILY_LIMIT) {
+    return res.status(429).json({ error: 'Rate limit: ' + MOVIE_DRAFT_DAILY_LIMIT + ' drafts per key per day. Try again tomorrow.', used_today: daily.count, limit: MOVIE_DRAFT_DAILY_LIMIT });
+  }
+
+  let out;
+  try {
+    out = await groqChatJson([
+      { role: 'system', content: BIBLE_SYSTEM },
+      { role: 'user', content: 'Series name: ' + (name || '(none yet)') + '.\n' +
+        'The idea so far: ' + (prompt || '(none)') + '.\n' +
+        'The bible so far: ' + (bible || '(empty)') + '\n' +
+        'Reply with the JSON object only.' },
+    ], { apiKey: process.env.GROQ_API_KEY, model: GROQ_MODEL, temperature: 0.6, max_tokens: 700 });
+  } catch (e) {
+    return res.status(502).json({ error: 'suggestions failed: ' + e.message });
+  }
+  const list = Array.isArray(out && out.suggestions) ? out.suggestions : [];
+  const suggestions = list
+    .map((entry) => ({
+      label: String((entry && entry.label) || '').trim().slice(0, 40),
+      text: String((entry && entry.text) || '').trim().slice(0, 400),
+    }))
+    .filter((entry) => entry.text)
+    .slice(0, 4);
+  if (!suggestions.length) return res.status(502).json({ error: 'the model returned nothing usable. Try again, or write it yourself.' });
+  res.json({ suggestions, cost: 'free' });
+});
+
 app.post('/v1/series', async (req, res) => {
   const b = req.body || {};
   const name = String(b.name || '').trim().slice(0, 80);
   const bible = String(b.bible || '').trim().slice(0, 2000);
+  const prompt = String(b.prompt || '').trim().slice(0, 600);
   if (!name) return res.status(400).json({ error: 'name is required' });
   if (!pool || dbBroken) return res.status(503).json({ error: 'series needs the database, which is not configured' });
   const id = 'ser_' + crypto.randomUUID();
   try {
-    await pool.query('INSERT INTO series (id, key, name, bible) VALUES ($1,$2,$3,$4)', [id, req.apiKey, name, bible]);
-    res.status(201).json({ series_id: id, name, bible, cost: 'free' });
+    await pool.query('INSERT INTO series (id, key, name, bible, prompt) VALUES ($1,$2,$3,$4,$5)', [id, req.apiKey, name, bible, prompt || null]);
+    res.status(201).json({ series_id: id, name, bible, prompt: prompt || null, cost: 'free' });
   } catch (e) {
     res.status(500).json({ error: 'could not save the series: ' + e.message });
   }
@@ -3987,7 +4038,7 @@ app.post('/v1/series', async (req, res) => {
 app.get('/v1/series', async (req, res) => {
   if (!pool || dbBroken) return res.json({ series: [] });
   try {
-    const r = await pool.query('SELECT id, name, bible, created_at FROM series WHERE key = $1 ORDER BY created_at DESC LIMIT 50', [req.apiKey]);
+    const r = await pool.query('SELECT id, name, bible, prompt, created_at FROM series WHERE key = $1 ORDER BY created_at DESC LIMIT 50', [req.apiKey]);
     res.json({ series: r.rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

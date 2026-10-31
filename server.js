@@ -856,7 +856,22 @@ function nearestAspect(width, height) {
 }
 
 async function replicateGenerateImage(prompt, width, height, seed) {
-  const entry = { model: REPLICATE_IMAGE_MODEL };
+  const candidates = [REPLICATE_IMAGE_MODEL, 'black-forest-labs/flux-schnell', 'black-forest-labs/flux-dev']
+    .filter((model, index, all) => model && all.indexOf(model) === index);
+  let lastError = null;
+  for (const model of candidates) {
+    try {
+      return await replicateImageWith({ model }, prompt, width, height, seed);
+    } catch (e) {
+      lastError = e;
+      // A 404/422 means this model does not exist for the account; another may.
+      if (e.status !== 404 && e.status !== 422) throw e;
+    }
+  }
+  throw lastError || new Error('replicate image failed');
+}
+
+async function replicateImageWith(entry, prompt, width, height, seed) {
   const input = {
     prompt: String(prompt).slice(0, 2000),
     aspect_ratio: nearestAspect(width || 1024, height || 1024),
@@ -901,6 +916,9 @@ async function generateImage(opts) {
   const h = Math.min(Math.max(parseInt(opts.height) || (resolved && resolved.params && resolved.params.height) || 1024, 256), 1920);
   const base = (opts.baseUrl || process.env.PUBLIC_BASE_URL || ('http://localhost:' + PORT)).replace(/\/+$/, '');
   const replicateReady = !!process.env.REPLICATE_API_TOKEN;
+  // Providers fail down silently by design; the reasons travel back to the caller so a
+  // failed still can be diagnosed without shell access to the host.
+  const providerErrors = [];
 
   // Cloudflare first when configured, but a spent quota must not end the request:
   // the error is caught and the paid provider is tried before the keyless host.
@@ -908,25 +926,27 @@ async function generateImage(opts) {
     try {
       const { buf, mime } = await cfGenerateImage(basePrompt, opts.seed);
       const id = await mediaSave(buf, mime, basePrompt);
-      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare' };
+      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare', provider_errors: providerErrors };
     } catch (e) {
       console.error('cloudflare image failed, trying the next provider:', e.message);
+      providerErrors.push({ provider: 'cloudflare', error: String(e.message).slice(0, 300) });
     }
   }
   if (replicateReady) {
     try {
       const { buf, mime } = await replicateGenerateImage(basePrompt, w, h, opts.seed);
       const id = await mediaSave(buf, mime, basePrompt);
-      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, provider: 'replicate' };
+      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, provider: 'replicate', provider_errors: providerErrors };
     } catch (e) {
       console.error('replicate image failed, falling back to the keyless host:', e.message);
+      providerErrors.push({ provider: 'replicate', error: String(e.message).slice(0, 300) });
     }
   }
   // fallback (free, no key): Pollinations URL serves the image directly
   const params = new URLSearchParams({ width: String(w), height: String(h), nologo: 'true' });
   if (opts.model) params.set('model', String(opts.model));
   if (opts.seed) params.set('seed', String(opts.seed));
-  return { url: `https://image.pollinations.ai/prompt/${encodeURIComponent(basePrompt)}?${params}`, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, provider: 'pollinations' };
+  return { url: `https://image.pollinations.ai/prompt/${encodeURIComponent(basePrompt)}?${params}`, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, provider: 'pollinations', provider_errors: providerErrors };
 }
 
 app.post('/v1/image/generate', async (req, res) => {

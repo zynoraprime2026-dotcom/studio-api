@@ -409,6 +409,17 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  // Moving off a database that is about to expire: copy it in once, at boot,
+  // after the schema exists. Idempotent, and it never writes to the source.
+  if (process.env.MIGRATE_FROM) {
+    try {
+      const { copyDatabase } = require('./lib/copy-db');
+      const result = await copyDatabase({ pool, sourceUrl: process.env.MIGRATE_FROM });
+      console.log('[db-copy] finished: ' + JSON.stringify(result));
+    } catch (e) {
+      console.error('[db-copy] failed, nothing was dropped:', e.message);
+    }
+  }
 }
 
 async function saveDeveloperKey(email, key) {

@@ -843,6 +843,50 @@ async function cfGenerateImage(basePrompt, seed) {
   return { buf, mime: ct || 'image/jpeg' };
 }
 
+// Replicate stills. Cloudflare Workers AI is the primary image provider, but its free
+// daily neuron allowance runs out and then every request 429s; Replicate is already
+// configured for image-to-video, so the same key can draw stills and keep the service
+// useful after Cloudflare's quota is spent.
+const REPLICATE_IMAGE_MODEL = (process.env.REPLICATE_IMAGE_MODEL || 'black-forest-labs/flux-schnell').trim();
+
+function nearestAspect(width, height) {
+  const ratio = width / height;
+  const options = [['1:1', 1], ['3:4', 0.75], ['4:3', 1.3333], ['9:16', 0.5625], ['16:9', 1.7778], ['2:3', 0.6667], ['3:2', 1.5]];
+  return options.reduce((best, cur) => (Math.abs(cur[1] - ratio) < Math.abs(best[1] - ratio) ? cur : best))[0];
+}
+
+async function replicateGenerateImage(prompt, width, height, seed) {
+  const entry = { model: REPLICATE_IMAGE_MODEL };
+  const input = {
+    prompt: String(prompt).slice(0, 2000),
+    aspect_ratio: nearestAspect(width || 1024, height || 1024),
+    output_format: 'jpg',
+    num_outputs: 1,
+  };
+  if (seed) input.seed = Number(seed) || undefined;
+  const pred = await replicateStart(entry, input);
+  let current = pred;
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    const status = current.status;
+    if (status === 'succeeded') {
+      const out = Array.isArray(current.output) ? current.output[0] : current.output;
+      if (!out) throw new Error('replicate returned no image');
+      const img = await fetch(out);
+      if (!img.ok) throw new Error('replicate image download failed ' + img.status);
+      const buf = Buffer.from(await img.arrayBuffer());
+      if (!buf.length) throw new Error('replicate returned an empty image');
+      return { buf, mime: img.headers.get('content-type') || 'image/jpeg' };
+    }
+    if (status === 'failed' || status === 'canceled') {
+      throw new Error('replicate image ' + status + ': ' + (current.error || 'unknown reason'));
+    }
+    await new Promise((r) => setTimeout(r, 1_500));
+    current = await replicatePoll(current);
+  }
+  throw new Error('replicate image timed out');
+}
+
 // unified image generation — used by /v1/image/generate, workflows, portfolios, and games
 async function generateImage(opts) {
   let basePrompt = (typeof opts.prompt === 'string') ? opts.prompt : '';
@@ -856,10 +900,27 @@ async function generateImage(opts) {
   const w = Math.min(Math.max(parseInt(opts.width) || (resolved && resolved.params && resolved.params.width) || 1024, 256), 1920);
   const h = Math.min(Math.max(parseInt(opts.height) || (resolved && resolved.params && resolved.params.height) || 1024, 256), 1920);
   const base = (opts.baseUrl || process.env.PUBLIC_BASE_URL || ('http://localhost:' + PORT)).replace(/\/+$/, '');
+  const replicateReady = !!process.env.REPLICATE_API_TOKEN;
+
+  // Cloudflare first when configured, but a spent quota must not end the request:
+  // the error is caught and the paid provider is tried before the keyless host.
   if (cfReady) {
-    const { buf, mime } = await cfGenerateImage(basePrompt, opts.seed);
-    const id = await mediaSave(buf, mime, basePrompt);
-    return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare' };
+    try {
+      const { buf, mime } = await cfGenerateImage(basePrompt, opts.seed);
+      const id = await mediaSave(buf, mime, basePrompt);
+      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare' };
+    } catch (e) {
+      console.error('cloudflare image failed, trying the next provider:', e.message);
+    }
+  }
+  if (replicateReady) {
+    try {
+      const { buf, mime } = await replicateGenerateImage(basePrompt, w, h, opts.seed);
+      const id = await mediaSave(buf, mime, basePrompt);
+      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: w, height: h, provider: 'replicate' };
+    } catch (e) {
+      console.error('replicate image failed, falling back to the keyless host:', e.message);
+    }
   }
   // fallback (free, no key): Pollinations URL serves the image directly
   const params = new URLSearchParams({ width: String(w), height: String(h), nologo: 'true' });

@@ -3461,7 +3461,10 @@ async function runMoviePipeline(movie, opts) {
               // only then fall back to the keyless provider (metered per IP).
               const cfNote = String(cfErr.message || cfErr).slice(0, 90);
               try {
-                await retryAsync(() => replicateImageToFile(cfPrompt, W, H, imgPath), 2, 4000);
+                await retryAsync(async () => {
+                  const { buf } = await replicateGenerateImage(cfPrompt, W, H, movieSeed);
+                  fs.writeFileSync(imgPath, buf);
+                }, 2, 4000);
                 out.imageSourceUrl = assetBase + 'image';
                 out.imageProvider = 'replicate';
                 out.imageNote = 'cloudflare was unavailable: ' + cfNote;
@@ -3822,38 +3825,6 @@ app.post('/v1/movie/create', async (req, res) => {
     cost: movieCost + ' uses', daily_limit: MOVIE_DAILY_LIMIT, webhook: !!hook
   });
 });
-
-// Replicate can draw a still too. Cloudflare's free image allocation runs out
-// daily and the keyless provider meters at one image per 45 seconds, so a paid
-// film needs a third route that is neither free-tier bound nor metered by IP.
-async function replicateImageToFile(prompt, W, H, destPath) {
-  const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) throw new Error('REPLICATE_API_TOKEN is not configured');
-  const ratio = Math.abs(W / H - 16 / 9) < 0.12 ? '16:9'
-    : Math.abs(H / W - 16 / 9) < 0.12 ? '9:16'
-    : Math.abs(W / H - 1) < 0.12 ? '1:1' : '3:2';
-  const resp = await fetch('https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', Prefer: 'wait=60' },
-    body: JSON.stringify({ input: { prompt: String(prompt).slice(0, 900), aspect_ratio: ratio, output_format: 'jpg', num_outputs: 1 } }),
-  });
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error('replicate still failed ' + resp.status + ': ' + (body.detail || body.error || ''));
-  let out = body.output;
-  // Prefer: wait usually returns the finished URLs; if it did not, poll briefly.
-  for (let i = 0; i < 20 && (!out || (Array.isArray(out) && !out.length)); i++) {
-    if (body.status === 'failed' || body.status === 'canceled') throw new Error('replicate still ' + body.status);
-    await new Promise((r) => setTimeout(r, 2000));
-    const poll = await fetch('https://api.replicate.com/v1/predictions/' + body.id, { headers: { Authorization: 'Bearer ' + token } });
-    const fresh = await poll.json().catch(() => ({}));
-    out = fresh.output;
-    if (fresh.status === 'failed' || fresh.status === 'canceled') throw new Error('replicate still ' + fresh.status);
-  }
-  const url = Array.isArray(out) ? out[0] : (typeof out === 'string' ? out : null);
-  if (!url) throw new Error('replicate returned no image');
-  await mvFetchImage(url, destPath);
-  return url;
-}
 
 // POST /v1/movie/:id/retry -> free
 // A render can fail on something outside the film: a provider's daily cap, an

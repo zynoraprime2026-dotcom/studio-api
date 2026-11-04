@@ -89,3 +89,33 @@ test('an unreadable reply is an error, not a silent empty draft', async () => {
   const { impl } = stub(['I cannot help with that.', 'Still no JSON.']);
   await assert.rejects(() => groqChatJson([{ role: 'user', content: 'x' }], { apiKey: 'k', fetchImpl: impl }), /not JSON/);
 });
+
+test('falls back to Gemini when the Groq quota is spent', async () => {
+  const calls = [];
+  const impl = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body || '{}') });
+    if (url.includes('api.groq.com')) {
+      return { ok: false, status: 429, json: async () => ({ error: { message: 'Rate limit reached for tokens per day' } }) };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ candidates: [{ content: { parts: [{ text: '{"title":"Coral Road"}' }] } }] })
+    };
+  };
+  const out = await groqChatJson([{ role: 'system', content: 'be terse' }, { role: 'user', content: 'hello' }], {
+    apiKey: 'groq-key', geminiKey: 'gem-key', fetchImpl: impl
+  });
+  assert.equal(out.title, 'Coral Road');
+  const gem = calls.find((c) => c.url.includes('generativelanguage'));
+  assert.ok(gem, 'gemini was called');
+  assert.equal(gem.body.systemInstruction.parts[0].text, 'be terse');
+  assert.equal(gem.body.contents[0].parts[0].text, 'hello');
+});
+
+test('still reports a missing key when no provider is configured', async () => {
+  await assert.rejects(
+    () => groqChatJson([{ role: 'user', content: 'hi' }], { apiKey: '', geminiKey: '' }),
+    /No LLM provider configured/
+  );
+});

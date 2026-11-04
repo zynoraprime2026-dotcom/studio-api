@@ -701,7 +701,8 @@ const providerReadiness = () => buildReadiness({
   imageModel: CF_IMAGE_MODEL,
   replicateReady: !!process.env.REPLICATE_API_TOKEN,
   falReady: !!process.env.FAL_KEY,
-  llmReady: !!process.env.GROQ_API_KEY,
+  llmReady: !!(process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY),
+  llmProviders: [process.env.GROQ_API_KEY ? 'groq' : null, process.env.GEMINI_API_KEY ? 'gemini' : null].filter(Boolean),
   dbReady: !!process.env.DATABASE_URL,
   publicBaseUrl: process.env.PUBLIC_BASE_URL || null
 });
@@ -3688,7 +3689,7 @@ app.post('/v1/movie/draft', async (req, res) => {
   const prompt = String(b.prompt || b.idea || b.story || '').trim();
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
   if (prompt.length > 2000) return res.status(400).json({ error: 'prompt is too long (max 2000 characters)' });
-  if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'drafting needs GROQ_API_KEY on the server' });
+  if (!process.env.GROQ_API_KEY && !process.env.GEMINI_API_KEY) return res.status(503).json({ error: 'drafting needs GROQ_API_KEY or GEMINI_API_KEY on the server' });
 
   const ar = String(b.aspectRatio || b.aspect || '9:16').toLowerCase();
   const aspect = (ar === '16:9' || ar === 'wide' || ar === 'landscape' || ar === 'widescreen') ? '16:9' : '9:16';
@@ -4189,7 +4190,7 @@ app.post('/v1/series/suggestions', async (req, res) => {
   const bible = String(b.bible || '').trim().slice(0, 2000);
   const prompt = String(b.prompt || '').trim().slice(0, 600);
   if (!name && !bible && !prompt) return res.status(400).json({ error: 'Write a name, an idea or a line of the bible first.' });
-  if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'suggestions need GROQ_API_KEY on the server' });
+  if (!process.env.GROQ_API_KEY && !process.env.GEMINI_API_KEY) return res.status(503).json({ error: 'suggestions need GROQ_API_KEY or GEMINI_API_KEY on the server' });
 
   const daily = await mvDraftDailyUsed(req.apiKey);
   if (daily.count >= MOVIE_DRAFT_DAILY_LIMIT) {

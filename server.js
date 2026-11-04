@@ -1468,7 +1468,28 @@ const DEFAULT_VOICE = 'en-US-GuyNeural';
 async function speakText(text, voice, rate, outPath) {
   const v = VOICE_RE.test(String(voice || '')) ? String(voice) : DEFAULT_VOICE;
   const r = /^-?\d+%$/.test(String(rate || '')) ? String(rate) : '+0%';
-  await execFileAsync('edge-tts', ['--voice', v, '--rate=' + r, '--text', String(text).slice(0, 2000), '--write-media', outPath], { timeout: 120000, maxBuffer: 1024 * 1024 });
+  // edge-tts streams the audio, so a dropped connection leaves a truncated MP3 that
+  // ffprobe cannot read and the whole film then fails at assembly. Check the bytes
+  // and re-speak instead of handing a broken track to ffmpeg.
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      try { fs.unlinkSync(outPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      await execFileAsync('edge-tts', ['--voice', v, '--rate=' + r, '--text', String(text).slice(0, 2000), '--write-media', outPath], { timeout: 120000, maxBuffer: 1024 * 1024 });
+      const size = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
+      if (size < 2048) {
+        lastError = new Error('narration audio came back empty (' + size + ' bytes)');
+      } else {
+        const seconds = await mediaDuration(outPath).catch(() => 0);
+        if (seconds > 0.2) return;
+        lastError = new Error('narration audio was unreadable (' + size + ' bytes)');
+      }
+    } catch (e) {
+      lastError = e;
+    }
+    await new Promise((done) => setTimeout(done, 800 * (attempt + 1)));
+  }
+  throw lastError || new Error('narration failed');
 }
 
 async function mediaDuration(p) {
@@ -3199,8 +3220,8 @@ async function computeSceneDurations(movie, dir, included, overlap, titleShift) 
   for (const i of included) {
     const sc = movie.scenes[i];
     const f = movieSceneFiles(dir, i);
-    const clipDur = await mediaDuration(f.clip);
-    const narrDur = fs.existsSync(f.narr) ? await mediaDuration(f.narr) : 0;
+    const clipDur = await mediaDuration(f.clip).catch(() => 5);
+    const narrDur = fs.existsSync(f.narr) ? await mediaDuration(f.narr).catch(() => 0) : 0;
     const segDur = Math.max(clipDur, narrDur) + (narrDur ? 0.3 : 0);
     sc.duration = Math.round(segDur * 100) / 100;
     sc.assembled = true;
@@ -3269,7 +3290,10 @@ async function assembleMovie(movie, dir, opts) {
   for (const i of included) {
     const sc = movie.scenes[i];
     const f = movieSceneFiles(dir, i);
-    const hasNarr = fs.existsSync(f.narr);
+    // A truncated track counts as no track: the scene plays silenced rather than
+    // taking the whole film down at the mux step.
+    const hasNarr = fs.existsSync(f.narr) && fs.statSync(f.narr).size > 2048 &&
+      (await mediaDuration(f.narr).catch(() => 0)) > 0.2;
     const clipDur = await mediaDuration(f.clip);
     const padDur = Math.max(0, sc.duration - clipDur);
     const args = ['-y', '-i', f.clip];

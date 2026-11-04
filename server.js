@@ -3412,6 +3412,13 @@ async function appendBrandCard(dir, brand, W, H, bodyPath) {
   if (!clean) return { path: bodyPath, applied: false, error: 'no brand kit' };
   const fonts = hostFonts();
   const frame = path.join(dir, 'brand-frame.png');
+  // the card has to be frame-identical to the film or the copy-join refuses it
+  let rate = '30';
+  try {
+    const probed = await execFileAsync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate', '-of', 'csv=p=0', bodyPath], { timeout: 20000 });
+    const r = String(probed.stdout || '').trim();
+    if (/^\d+\/\d+$/.test(r)) rate = r;
+  } catch (e) {}
   const card = path.join(dir, 'brand-card.mp4');
   const merged = path.join(dir, 'branded.mp4');
   try {
@@ -3421,14 +3428,26 @@ async function appendBrandCard(dir, brand, W, H, bodyPath) {
     await execFileAsync('ffmpeg', ['-y', '-loop', '1', '-t', String(clean.seconds), '-i', frame,
       '-f', 'lavfi', '-t', String(clean.seconds), '-i', 'anullsrc=r=44100:cl=stereo',
       '-filter_complex', '[0:v]' + brandCardFilters(clean, W, H, fonts).join(',') + ',format=yuv420p[v]',
-      '-map', '[v]', '-map', '1:a', '-r', '30', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-      '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', card],
+      // encoded exactly like the scenes so the two can be joined without a re-encode:
+      // a second full pass is what pushed this box over its memory and restarted it
+      '-map', '[v]', '-map', '1:a', '-r', rate, '-threads', '1', '-filter_threads', '1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
+      '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', card],
       { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
-    await execFileAsync('ffmpeg', ['-y', '-i', bodyPath, '-i', card,
-      '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v];[0:a][1:a]concat=n=2:v=0:a=1[a]',
-      '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-      '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', '-pix_fmt', 'yuv420p', merged],
-      { maxBuffer: 1024 * 1024 * 10, timeout: 8 * 60 * 1000 });
+    const cardList = path.join(dir, 'brand-list.txt');
+    fs.writeFileSync(cardList, "file '" + bodyPath.replace(/'/g, "'\\''") + "'\nfile '" + card.replace(/'/g, "'\\''") + "'\n");
+    try {
+      await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', cardList, '-c', 'copy', merged],
+        { maxBuffer: 1024 * 1024 * 10, timeout: 3 * 60 * 1000 });
+    } finally { try { fs.unlinkSync(cardList); } catch (e) {} }
+    if (!fs.existsSync(merged) || fs.statSync(merged).size < 10000) {
+      await execFileAsync('ffmpeg', ['-y', '-i', bodyPath, '-i', card,
+        '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v];[0:a][1:a]concat=n=2:v=0:a=1[a]',
+        '-map', '[v]', '-map', '[a]', '-threads', '1', '-filter_threads', '1',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
+        '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', merged],
+        { maxBuffer: 1024 * 1024 * 10, timeout: 8 * 60 * 1000 });
+    }
     return { path: merged, applied: true, seconds: clean.seconds, fonts };
   } catch (e) {
     const msg = String(e.message || '').split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 300);

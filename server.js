@@ -3713,6 +3713,56 @@ app.post('/v1/movie/draft', async (req, res) => {
     return res.status(429).json({ error: 'Free monthly limit reached (' + FREE_MONTHLY_LIMIT + ' operations). Email support to upgrade.', limit: FREE_MONTHLY_LIMIT, used });
   }
 
+  // A shot list you wrote yourself needs no model at all: hand it in as `scenes`
+  // and it is registered as an approved draft, so a spent LLM quota can never
+  // stop a film you already know how to make. Nothing is charged for it.
+  const handWritten = Array.isArray(b.scenes) && b.scenes.length ? normalizeScriptScenes(b.scenes) : null;
+  if (handWritten && handWritten.length) {
+    await addUsage(req.apiKey, -MOVIE_DRAFT_COST);
+    const handId = 'drf_' + crypto.randomUUID();
+    const handDraft = {
+      title: String(b.title || prompt).trim().slice(0, 80) || 'Untitled film',
+      logline: String(b.logline || '').trim().slice(0, 200),
+      styleBible: String(b.style || '').trim().slice(0, 400),
+      character: character || null,
+      musicMood: MOVIE_MOODS.includes(String(b.musicMood || '').toLowerCase()) ? String(b.musicMood).toLowerCase() : 'calm',
+      scenes: handWritten
+    };
+    for (const sc of handDraft.scenes) {
+      if (!sc.visualPrompt) continue;
+      const g = contentGuard(sc.visualPrompt);
+      sc.visualPrompt = g.prompt;
+      sc.contentGuard = g.applied ? { applied: true, replaced: g.replaced } : null;
+    }
+    const handSuggested = {
+      aspectRatio: aspect,
+      narratorVoice: movieDefaultVoice(language),
+      musicMood: handDraft.musicMood,
+      titleCard: true,
+      burnSubtitles: true,
+      crossfade: true,
+      continuity: 'chained',
+      narrationRate: '+0%'
+    };
+    if (seriesDraft) handDraft.seriesId = seriesDraft.id;
+    await mvDraftSave({ id: handId, key: req.apiKey, prompt, language, draft: Object.assign({}, handDraft, { suggested: handSuggested }), createdAt: new Date().toISOString() });
+    return res.json({
+      draft_id: handId,
+      expires_at: new Date(Date.now() + MOVIE_DRAFT_TTL_HOURS * 3600e3).toISOString(),
+      title: handDraft.title,
+      logline: handDraft.logline,
+      style_bible: handDraft.styleBible,
+      character: handDraft.character,
+      scenes: handDraft.scenes,
+      suggested: handSuggested,
+      notes: 'shot list supplied by the caller, no model used',
+      language,
+      duration_per_scene: duration,
+      series_id: seriesDraft ? seriesDraft.id : null,
+      cost: '0 uses (shot list supplied)'
+    });
+  }
+
   let draft;
   try {
     draft = await groqMovieDraft(prompt, { style, language, duration, character, scenes: scenesWanted });

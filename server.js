@@ -2905,7 +2905,8 @@ async function groqMovieScenes(story, style, language, maxScenes) {
   // attempt 1: JSON mode; attempt 2 (fallback): plain completion (in case JSON mode is rejected)
   for (const useJson of [true, false]) {
     try {
-      const body = { model: GROQ_MODEL, messages, temperature: 0.6, max_tokens: 2500 };
+      // budget the answer by shot count: a 5-shot list is short JSON, not a novel
+      const body = { model: GROQ_MODEL, messages, temperature: 0.6, max_tokens: Math.min(2400, 600 + Math.max(1, target) * 180) };
       if (useJson) body.response_format = { type: 'json_object' };
       const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',

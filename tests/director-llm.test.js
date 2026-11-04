@@ -119,3 +119,26 @@ test('still reports a missing key when no provider is configured', async () => {
     /No LLM provider configured/
   );
 });
+
+test('a spent quota skips the second Groq attempt and goes straight to the next provider', async () => {
+  const calls = [];
+  const impl = async (url) => {
+    calls.push(url);
+    if (url.includes('api.groq.com')) {
+      return { ok: false, status: 429, json: async () => ({ error: { message: 'Rate limit reached ... tokens per day (TPD)' } }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"title":"Coral Road"}' }] } }] }) };
+  };
+  const out = await groqChatJson([{ role: 'user', content: 'x' }], { apiKey: 'g', geminiKey: 'm', fetchImpl: impl });
+  assert.equal(out.title, 'Coral Road');
+  assert.equal(calls.filter((u) => u.includes('api.groq.com')).length, 1, 'only one doomed Groq call');
+});
+
+test('the shot call reserves a budget that scales with the number of shots', async () => {
+  const { impl, calls } = stub([BIBLE, SHOTS]);
+  await groqMovieDraft('A boy finds a brass compass', { apiKey: 'k', fetchImpl: impl, duration: 5, scenes: 4 });
+  const budget = calls[1].body.max_tokens;
+  assert.ok(budget > 600, 'four shots still get room to answer');
+  assert.ok(budget < 2500, 'but nowhere near the old trailer-sized reservation');
+  assert.ok(calls[0].body.max_tokens <= 600, 'the identity call is small on purpose');
+});

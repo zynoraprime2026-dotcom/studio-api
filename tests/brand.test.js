@@ -60,3 +60,12 @@ test('an apostrophe does not break the ffmpeg filter', () => {
   assert.ok(!/text='Rahim's/.test(f), 'the quote is neutralised');
   assert.ok(f.includes('Rahim'));
 });
+
+test('the card link dials internationally, whatever the shop typed', () => {
+  // A wa.me link with a local 054 number opens nothing, so the leading zero
+  // has to become the Ghana country code before it reaches the card.
+  assert.strictEqual(normalizeBrand({ name: 'S', whatsapp: '0541821537' }).waLink, 'wa.me/233541821537');
+  assert.strictEqual(normalizeBrand({ name: 'S', whatsapp: '+233 54 182 1537' }).waLink, 'wa.me/233541821537');
+  assert.strictEqual(normalizeBrand({ name: 'S', whatsapp: '541821537' }).waLink, 'wa.me/233541821537');
+  assert.strictEqual(normalizeBrand({ name: 'S', whatsapp: '+1 978 494 5552' }).waLink, 'wa.me/19784945552');
+});

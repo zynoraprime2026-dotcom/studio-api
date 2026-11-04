@@ -779,7 +779,8 @@ app.get('/v1/health', (req, res) => res.json({
   service: 'studio-api',
   time: new Date().toISOString(),
   uptime_seconds: Math.round(process.uptime()),
-  providers: providerReadiness()
+  providers: providerReadiness(),
+  fonts: hostFonts()
 }));
 
 // ---------- image generation ----------
@@ -3381,19 +3382,45 @@ async function brandGet(key) {
  * A card that fails must never cost the callers their film, so the body is
  * returned untouched on any error.
  */
+// Which fonts this host actually has decides whether the card can be drawn.
+const FONT_CANDIDATES = {
+  serifBold: ['/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf', '/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf', '/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf', '/usr/share/fonts/dejavu/DejaVuSerif-Bold.ttf'],
+  sansBold: ['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf', '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf', '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf'],
+  sans: ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/TTF/DejaVuSans.ttf', '/usr/share/fonts/dejavu/DejaVuSans.ttf']
+};
+let fontProbe = null;
+function hostFonts() {
+  if (fontProbe) return fontProbe;
+  const out = {};
+  const { execFileSync } = require('child_process');
+  for (const [slot, paths] of Object.entries(FONT_CANDIDATES)) {
+    out[slot] = paths.find(f => { try { return fs.existsSync(f); } catch (e) { return false; } }) || null;
+  }
+  // last resort: ask fontconfig, which knows paths the list above may miss
+  if (!out.sans || !out.sansBold || !out.serifBold) {
+    const ask = (q) => { try { return execFileSync('fc-match', ['-f', '%{file}', q], { timeout: 5000 }).toString().trim() || null; } catch (e) { return null; } };
+    out.serifBold = out.serifBold || ask('serif:bold');
+    out.sansBold = out.sansBold || ask('sans:bold');
+    out.sans = out.sans || ask('sans');
+  }
+  fontProbe = out;
+  return out;
+}
+
 async function appendBrandCard(dir, brand, W, H, bodyPath) {
   const clean = normalizeBrand(brand);
-  if (!clean) return bodyPath;
+  if (!clean) return { path: bodyPath, applied: false, error: 'no brand kit' };
+  const fonts = hostFonts();
   const frame = path.join(dir, 'brand-frame.png');
   const card = path.join(dir, 'brand-card.mp4');
   const merged = path.join(dir, 'branded.mp4');
   try {
     await execFileAsync('ffmpeg', ['-y', '-sseof', '-0.4', '-i', bodyPath, '-frames:v', '1', frame],
       { maxBuffer: 1024 * 1024 * 10, timeout: 60 * 1000 });
-    if (!fs.existsSync(frame)) return bodyPath;
+    if (!fs.existsSync(frame)) return { path: bodyPath, applied: false, error: 'could not grab the last frame' };
     await execFileAsync('ffmpeg', ['-y', '-loop', '1', '-t', String(clean.seconds), '-i', frame,
       '-f', 'lavfi', '-t', String(clean.seconds), '-i', 'anullsrc=r=44100:cl=stereo',
-      '-filter_complex', '[0:v]' + brandCardFilters(clean, W, H).join(',') + ',format=yuv420p[v]',
+      '-filter_complex', '[0:v]' + brandCardFilters(clean, W, H, fonts).join(',') + ',format=yuv420p[v]',
       '-map', '[v]', '-map', '1:a', '-r', '30', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
       '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', card],
       { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
@@ -3402,10 +3429,11 @@ async function appendBrandCard(dir, brand, W, H, bodyPath) {
       '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
       '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', '-pix_fmt', 'yuv420p', merged],
       { maxBuffer: 1024 * 1024 * 10, timeout: 8 * 60 * 1000 });
-    return merged;
+    return { path: merged, applied: true, seconds: clean.seconds, fonts };
   } catch (e) {
-    console.error('brand card failed, shipping the film as cut:', e.message);
-    return bodyPath;
+    const msg = String(e.message || '').split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 300);
+    console.error('brand card failed, shipping the film as cut:', msg);
+    return { path: bodyPath, applied: false, error: msg, fonts };
   } finally {
     for (const f of [frame, card]) { try { fs.unlinkSync(f); } catch (e) {} }
   }
@@ -3530,8 +3558,14 @@ async function assembleMovie(movie, dir, opts) {
 
   if (opts.brand) {
     const before = bodyPath;
-    bodyPath = await appendBrandCard(dir, opts.brand, W, H, before);
-    if (bodyPath !== before) { try { fs.unlinkSync(before); } catch (e) {} }
+    const card = await appendBrandCard(dir, opts.brand, W, H, before);
+    if (card.applied) {
+      bodyPath = card.path;
+      if (bodyPath !== before) { try { fs.unlinkSync(before); } catch (e) {} }
+    }
+    movie.brandCard = { applied: !!card.applied, seconds: card.seconds || null, error: card.error || null };
+  } else {
+    movie.brandCard = { applied: false, error: 'no brand kit on this film' };
   }
 
   const finalPath = path.join(dir, 'final.mp4');
@@ -4183,6 +4217,7 @@ app.get('/v1/movie/:id', async (req, res) => {
     duration: m.duration || null,
     language: m.language, style: m.style, aspectRatio: m.aspect, narratorVoice: m.narratorVoice,
     continuity: m.continuity || 'independent',
+    brandCard: m.brandCard || null,
     scenes: (m.scenes || []).map(s => ({
       id: s.id, imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration,
       narrationUrl: s.narrationUrl, visualPrompt: s.visualPrompt, contentGuard: s.contentGuard || null,

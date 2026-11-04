@@ -124,6 +124,7 @@ app.get('/masjid', (req, res) => {
 });
 
 // ---------- optional Postgres (Supabase) for developer keys ----------
+const { isFatalDbError } = require('./lib/dbhealth');
 let pg = null;
 if (process.env.DATABASE_URL) {
   try {
@@ -456,7 +457,7 @@ async function getUsage(key) {
     try {
       const r = await pool.query('SELECT count FROM api_usage WHERE key = $1 AND month = $2', [key, month]);
       return { month, used: r.rowCount ? parseInt(r.rows[0].count) : 0, mode: 'database' };
-    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('usage read failed, falling back to memory:', e.message); }
+    } catch (e) { lastDbError = e.message; if (isFatalDbError(e)) dbBroken = true; console.error('usage read failed, falling back to memory:', e.message); }
   }
   return { month, used: memUsage(key, month), mode: dbBroken ? 'memory' : 'memory' };
 }
@@ -467,7 +468,7 @@ async function incrUsage(key) {
     try {
       await pool.query('INSERT INTO api_usage (key, month, count) VALUES ($1, $2, 1) ON CONFLICT (key, month) DO UPDATE SET count = api_usage.count + 1', [key, month]);
       return;
-    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('usage incr failed, falling back to memory:', e.message); }
+    } catch (e) { lastDbError = e.message; if (isFatalDbError(e)) dbBroken = true; console.error('usage incr failed, falling back to memory:', e.message); }
   }
   const u = memoryUsage.get(key);
   memoryUsage.set(key, u && u.month === month ? { month, count: u.count + 1 } : { month, count: 1 });
@@ -493,6 +494,57 @@ app.get('/v1/db-check', async (req, res) => {
 });
 
 
+// POST /v1/admin/prune -> reclaim database space (the 1GB ceiling is real)
+// Films keep their newest cuts in Postgres so a restart can still serve them.
+// Older binaries are what fill the project, so this drops them oldest-first,
+// reports what it freed, and refuses to run without a real connection.
+app.post('/v1/admin/prune', async (req, res) => {
+  if (!pool || dbBroken) return res.status(503).json({ error: 'no database connection to prune' });
+  const b = req.body || {};
+  const dryRun = b.dry_run === true || b.dryRun === true;
+  const keepMovies = Math.min(50, Math.max(0, Number.isFinite(Number(b.keep_movies)) ? Number(b.keep_movies) : 3));
+  const keepDays = Math.min(365, Math.max(0, Number.isFinite(Number(b.keep_days)) ? Number(b.keep_days) : 7));
+  try {
+    const sizeOf = async (t) => (await pool.query('SELECT pg_total_relation_size($1) AS n', [t])).rows[0].n;
+    const before = { movie_assets: Number(await sizeOf('movie_assets')), media: Number(await sizeOf('media')) };
+
+    // newest films per key survive; the rest are prunable binaries
+    const ranked = await pool.query(`
+      SELECT movie_id, SUM(octet_length(bytes))::bigint AS bytes, COUNT(*)::int AS files, MAX(created_at) AS newest
+      FROM movie_assets GROUP BY movie_id ORDER BY MAX(created_at) DESC`);
+    const doomedMovies = ranked.rows.slice(keepMovies).map(r => r.movie_id);
+    const movieBytes = ranked.rows.slice(keepMovies).reduce((n, r) => n + Number(r.bytes || 0), 0);
+
+    const oldMedia = await pool.query(
+      'SELECT COUNT(*)::int AS files, COALESCE(SUM(octet_length(bytes)),0)::bigint AS bytes FROM media WHERE created_at < NOW() - make_interval(days => $1)',
+      [keepDays]);
+
+    const plan = {
+      database: activeDbUrl ? new URL(activeDbUrl).hostname : null,
+      keep_movies: keepMovies,
+      keep_days: keepDays,
+      prunable_movies: doomedMovies.length,
+      prunable_movie_bytes: movieBytes,
+      prunable_media_files: oldMedia.rows[0].files,
+      prunable_media_bytes: Number(oldMedia.rows[0].bytes),
+      before_bytes: before.movie_assets + before.media
+    };
+    if (dryRun) return res.json({ dry_run: true, plan });
+
+    // batched: a full project has barely room for a huge transaction
+    for (let i = 0; i < doomedMovies.length; i += 10) {
+      await pool.query('DELETE FROM movie_assets WHERE movie_id = ANY($1::text[])', [doomedMovies.slice(i, i + 10)]);
+    }
+    await pool.query('DELETE FROM media WHERE created_at < NOW() - make_interval(days => $1)', [keepDays]);
+    try { await pool.query('VACUUM movie_assets'); await pool.query('VACUUM media'); } catch (e) { /* neon may refuse offline; deletion already frees pages */ }
+    const after = { movie_assets: Number(await sizeOf('movie_assets')), media: Number(await sizeOf('media')) };
+    res.json({ pruned: true, plan, after_bytes: after.movie_assets + after.media, freed_bytes: Math.max(0, plan.before_bytes - (after.movie_assets + after.media)) });
+  } catch (e) {
+    lastDbError = e.message;
+    res.status(500).json({ error: 'prune failed: ' + String(e.message).slice(0, 200) });
+  }
+});
+
 // ---------- prompt/parameter presets ----------
 const BUILTIN_PRESETS = [
   { id: 'abstract-gold', category: 'artist-style', name: 'abstract-gold', prompt: 'abstract modern islamic art, flowing gold and deep teal, luxurious, museum quality, high detail', params: { width: 1024, height: 1024 } },
@@ -510,7 +562,7 @@ async function listPresets() {
     try {
       const r = await pool.query('SELECT id, name, category, prompt, params FROM presets');
       custom = r.rows.map(x => ({ id: x.id, name: x.name, category: x.category, prompt: x.prompt, params: x.params || {} }));
-    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('preset list failed, memory mode:', e.message); }
+    } catch (e) { lastDbError = e.message; if (isFatalDbError(e)) dbBroken = true; console.error('preset list failed, memory mode:', e.message); }
   }
   if (!custom.length) custom = [...memoryPresets.values()];
   return BUILTIN_PRESETS.concat(custom);
@@ -527,7 +579,7 @@ async function createPreset(name, category, prompt, params) {
     try {
       await pool.query('INSERT INTO presets (id, name, category, prompt, params) VALUES ($1,$2,$3,$4,$5)', [id, name, category, prompt, JSON.stringify(params || {})]);
       return { id, name, category, prompt, params: params || {} };
-    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('preset save failed, memory mode:', e.message); }
+    } catch (e) { lastDbError = e.message; if (isFatalDbError(e)) dbBroken = true; console.error('preset save failed, memory mode:', e.message); }
   }
   const p = { id, name, category, prompt, params: params || {} };
   memoryPresets.set(id, p);
@@ -539,7 +591,7 @@ async function deletePreset(id) {
     try {
       const r = await pool.query('DELETE FROM presets WHERE id = $1 AND id NOT LIKE $2', [id, 'builtin%']);
       return r.rowCount > 0 || memoryPresets.delete(id);
-    } catch (e) { lastDbError = e.message; dbBroken = true; }
+    } catch (e) { lastDbError = e.message; if (isFatalDbError(e)) dbBroken = true; }
   }
   return memoryPresets.delete(id);
 }
@@ -2722,7 +2774,7 @@ async function addUsage(key, n) {
     try {
       await pool.query('INSERT INTO api_usage (key, month, count) VALUES ($1, $2, $3) ON CONFLICT (key, month) DO UPDATE SET count = api_usage.count + $3', [key, month, n]);
       return;
-    } catch (e) { lastDbError = e.message; dbBroken = true; console.error('usage bulk incr failed, falling back to memory:', e.message); }
+    } catch (e) { lastDbError = e.message; if (isFatalDbError(e)) dbBroken = true; console.error('usage bulk incr failed, falling back to memory:', e.message); }
   }
   const u = memoryUsage.get(key);
   const base = u && u.month === month ? u.count : 0;
@@ -2877,7 +2929,7 @@ async function mvDraftsSweep() {
 // director mode LLM plumbing lives in lib/director-llm.js so it can be tested
 // without a network; these wrappers supply the server's key, model and moods
 const { groqChatJson: groqChatJsonRaw, groqMovieDraft: groqMovieDraftRaw } = require('./lib/director-llm');
-const { spokenLine } = require('./lib/voices');
+const { spokenLine, castMap } = require('./lib/voices');
 const { castOf, vttToSrt, scriptCsv, scriptMarkdown, packageFor } = require('./lib/deliverables');
 const { verticalPlan, trailerPlan, trailerDuration } = require('./lib/recuts');
 
@@ -3264,6 +3316,18 @@ function burnedCaptionFilters(text, W) {
 // assemble: optional title card -> per-scene segments (clip + narration, video
 // padded to audio, optional burned captions) -> concat -> optional music bed
 // with narration ducking -> soft mov_text subtitles -> final.mp4
+// One cast per film: every named speaker gets their own voice, stable across
+// shots and re-shoots, so two characters never come out sounding the same.
+const voiceCasts = new Map();
+function castForMovie(movie) {
+  if (voiceCasts.has(movie.id)) return voiceCasts.get(movie.id);
+  const texts = (movie.scenes || []).map(s => s.narrationText || s.narration).filter(Boolean);
+  const cast = castMap(texts, movie.narratorVoice, movie.language);
+  voiceCasts.set(movie.id, cast);
+  if (voiceCasts.size > 200) voiceCasts.delete(voiceCasts.keys().next().value);
+  return cast;
+}
+
 // ---------- brand kit: the card every film ends on ----------
 const memoryBrands = new Map();
 
@@ -3682,7 +3746,7 @@ async function runMoviePipeline(movie, opts) {
         if (!fs.existsSync(narrPath)) await mvRestoreAsset(movie.id, 'narr' + i + '.mp3');
         if (!fs.existsSync(narrPath)) {
           try {
-            const cast = spokenLine(sc.narrationText, movie.narratorVoice, movie.language);
+            const cast = spokenLine(sc.narrationText, movie.narratorVoice, movie.language, castForMovie(movie));
             await retryOnce(() => speakText(cast.text, cast.voice, opts.rate, narrPath), 2000);
             await mvSaveAsset(movie.id, 'narr' + i + '.mp3');
           } catch (e) {
@@ -4136,9 +4200,26 @@ function mvAssetKind(file) {
   if (file === 'trailer.mp4') return { kind: 'trailer', idx: 0 };
   return null;
 }
+// The database is not a CDN: stop mirroring film binaries once the table is
+// fat, so the project cannot be filled to its ceiling again by one busy week.
+const ASSET_BUDGET_BYTES = Number(process.env.MOVIE_ASSET_BUDGET_MB || 600) * 1024 * 1024;
+let assetBudget = { checked: 0, full: false };
+
+async function assetBudgetFull() {
+  if (!pool || dbBroken) return false;
+  if (Date.now() - assetBudget.checked < 10 * 60 * 1000) return assetBudget.full;
+  try {
+    const r = await pool.query("SELECT pg_total_relation_size('movie_assets') AS n");
+    assetBudget = { checked: Date.now(), full: Number(r.rows[0].n) >= ASSET_BUDGET_BYTES };
+    if (assetBudget.full) console.error('movie asset mirror paused: table at budget, prune with POST /v1/admin/prune');
+  } catch (e) { assetBudget = { checked: Date.now(), full: false }; }
+  return assetBudget.full;
+}
+
 async function mvSaveAsset(movieId, file) {
   const k = mvAssetKind(file);
   if (!k || !pool || dbBroken) return false;
+  if (await assetBudgetFull()) return false;
   try {
     const p = path.join(MOVIE_DIR, movieId, file);
     if (!fs.existsSync(p)) return false;
@@ -4627,7 +4708,7 @@ async function reShootScene(m, idx, patch) {
   let narrationError = null, narrDur = null;
   if (narrationText) {
     try {
-      const cast = spokenLine(narrationText, m.narratorVoice, m.language);
+      const cast = spokenLine(narrationText, m.narratorVoice, m.language, castForMovie(m));
       await retryOnce(() => speakText(cast.text, cast.voice, rate, f.narr), 2000);
       await mvSaveAsset(m.id, 'narr' + idx + '.mp3');
       try { narrDur = await mediaDuration(f.narr); } catch (e) {}

@@ -3046,6 +3046,7 @@ function vttTimestamp(s) {
 }
 /** "Kofi: one more seam" is read by a voice, but a caption shows only what is said. */
 const { captionText } = require('./lib/captions');
+const { normalizeBrand, brandCardFilters } = require('./lib/brand');
 
 function buildVtt(cues) {
   return 'WEBVTT\n\n' + cues.map((c, i) =>
@@ -3263,6 +3264,74 @@ function burnedCaptionFilters(text, W) {
 // assemble: optional title card -> per-scene segments (clip + narration, video
 // padded to audio, optional burned captions) -> concat -> optional music bed
 // with narration ducking -> soft mov_text subtitles -> final.mp4
+// ---------- brand kit: the card every film ends on ----------
+const memoryBrands = new Map();
+
+async function brandSave(key, brand) {
+  memoryBrands.set(key, brand);
+  if (pool && !dbBroken) {
+    try {
+      await pool.query(
+        `CREATE TABLE IF NOT EXISTS brand_settings (key TEXT PRIMARY KEY, brand JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())`
+      );
+      await pool.query(
+        'INSERT INTO brand_settings (key, brand, updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (key) DO UPDATE SET brand = EXCLUDED.brand, updated_at = NOW()',
+        [key, JSON.stringify(brand)]
+      );
+    } catch (e) { lastDbError = e.message; console.error('brand save failed, memory only:', e.message); }
+  }
+  return brand;
+}
+
+async function brandGet(key) {
+  const mem = memoryBrands.get(key);
+  if (mem) return mem;
+  if (!pool || dbBroken) return null;
+  try {
+    const r = await pool.query('SELECT brand FROM brand_settings WHERE key = $1', [key]);
+    if (!r.rowCount) return null;
+    return normalizeBrand(r.rows[0].brand);
+  } catch (e) {
+    if (!/does not exist/i.test(String(e.message))) console.error('brand read failed:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Blur the film's last frame, print the shop on it, and glue it to the end.
+ * A card that fails must never cost the callers their film, so the body is
+ * returned untouched on any error.
+ */
+async function appendBrandCard(dir, brand, W, H, bodyPath) {
+  const clean = normalizeBrand(brand);
+  if (!clean) return bodyPath;
+  const frame = path.join(dir, 'brand-frame.png');
+  const card = path.join(dir, 'brand-card.mp4');
+  const merged = path.join(dir, 'branded.mp4');
+  try {
+    await execFileAsync('ffmpeg', ['-y', '-sseof', '-0.4', '-i', bodyPath, '-frames:v', '1', frame],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 60 * 1000 });
+    if (!fs.existsSync(frame)) return bodyPath;
+    await execFileAsync('ffmpeg', ['-y', '-loop', '1', '-t', String(clean.seconds), '-i', frame,
+      '-f', 'lavfi', '-t', String(clean.seconds), '-i', 'anullsrc=r=44100:cl=stereo',
+      '-filter_complex', '[0:v]' + brandCardFilters(clean, W, H).join(',') + ',format=yuv420p[v]',
+      '-map', '[v]', '-map', '1:a', '-r', '30', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', card],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
+    await execFileAsync('ffmpeg', ['-y', '-i', bodyPath, '-i', card,
+      '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v];[0:a][1:a]concat=n=2:v=0:a=1[a]',
+      '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', '-pix_fmt', 'yuv420p', merged],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 8 * 60 * 1000 });
+    return merged;
+  } catch (e) {
+    console.error('brand card failed, shipping the film as cut:', e.message);
+    return bodyPath;
+  } finally {
+    for (const f of [frame, card]) { try { fs.unlinkSync(f); } catch (e) {} }
+  }
+}
+
 async function assembleMovie(movie, dir, opts) {
   const W = opts.W, H = opts.H;
   const included = [];
@@ -3378,6 +3447,12 @@ async function assembleMovie(movie, dir, opts) {
       '-filter_complex', fc, '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-shortest', mixedPath],
       { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
     bodyPath = mixedPath;
+  }
+
+  if (opts.brand) {
+    const before = bodyPath;
+    bodyPath = await appendBrandCard(dir, opts.brand, W, H, before);
+    if (bodyPath !== before) { try { fs.unlinkSync(before); } catch (e) {} }
   }
 
   const finalPath = path.join(dir, 'final.mp4');
@@ -3654,6 +3729,7 @@ async function runMoviePipeline(movie, opts) {
     movie.duration = await assembleMovie(movie, dir, {
       W, H, musicFile, musicVolume: opts.musicVolume,
       burnSubtitles: opts.burnSubtitles, titleCard: opts.titleCard, crossfade: opts.crossfade,
+      brand: movie.brand || opts.brand || null,
       onProgress: (f) => { movie.progress = Math.round(82 + 13 * f); }
     });
     await mvSaveAsset(movie.id, 'final.mp4');
@@ -3892,9 +3968,13 @@ app.post('/v1/movie/create', async (req, res) => {
     duration: Math.min(10, Math.max(3, Math.round(Number(sc.duration) || 5))),
     image: sc.image || sc.imageUrl || null,
   }));
+  // brand: an explicit object wins, `brand: false` opts out, otherwise the saved kit
+  const brand = b.brand === false || b.brandCard === false
+    ? null
+    : (normalizeBrand(b.brand) || await brandGet(req.apiKey));
   const movie = {
     id, key: req.apiKey, title, status: 'queued', progress: 0, error: null,
-    aspect, language, style, narratorVoice, duration: null, scenes: plannedScenes, continuity,
+    aspect, language, style, narratorVoice, duration: null, scenes: plannedScenes, continuity, brand,
     render: { musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, style: look, rate, quality, seriesId: seriesRecord ? seriesRecord.id : null },
     createdAt: new Date().toISOString(),
     webhook: hook, baseUrl: 'https://' + req.get('host')
@@ -3914,10 +3994,33 @@ app.post('/v1/movie/create', async (req, res) => {
     scene_count_planned: providedScenes ? providedScenes.length : null,
     continuity,
     draft_id: draftRecord ? draftRecord.id : null,
+    brand_card: brand ? { name: brand.name, whatsapp: brand.phoneDisplay, seconds: brand.seconds } : null,
     locked_look: lockedLook,
     quality,
     cost: movieCost + ' uses', daily_limit: MOVIE_DAILY_LIMIT, webhook: !!hook
   });
+});
+
+// GET/POST /v1/brand -> the card stamped on every film
+app.get('/v1/brand', async (req, res) => {
+  const brand = await brandGet(req.apiKey);
+  res.json({ brand: brand, note: brand ? null : 'no brand kit saved yet - POST /v1/brand to set one' });
+});
+
+app.post('/v1/brand', async (req, res) => {
+  const brand = normalizeBrand(req.body || {});
+  if (!brand) return res.status(400).json({ error: 'a business name is required (name, whatsapp, tagline, accent, seconds)' });
+  await brandSave(req.apiKey, brand);
+  res.json({ saved: true, brand, note: 'every new film now ends on this card unless the request sends brand: false' });
+});
+
+app.delete('/v1/brand', async (req, res) => {
+  memoryBrands.delete(req.apiKey);
+  if (pool && !dbBroken) {
+    try { await pool.query('DELETE FROM brand_settings WHERE key = $1', [req.apiKey]); }
+    catch (e) { console.error('brand delete failed:', e.message); }
+  }
+  res.json({ deleted: true });
 });
 
 // POST /v1/movie/:id/retry -> free

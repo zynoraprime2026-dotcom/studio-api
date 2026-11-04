@@ -3044,6 +3044,9 @@ function vttTimestamp(s) {
   const p = (n, w) => String(n).padStart(w || 2, '0');
   return p(h) + ':' + p(m) + ':' + p(sec) + '.' + p(ms, 3);
 }
+/** "Kofi: one more seam" is read by a voice, but a caption shows only what is said. */
+const { captionText } = require('./lib/captions');
+
 function buildVtt(cues) {
   return 'WEBVTT\n\n' + cues.map((c, i) =>
     (i + 1) + '\n' + vttTimestamp(c.start) + ' --> ' + vttTimestamp(c.end) + '\n' + String(c.text).replace(/\r?\n/g, ' ')
@@ -3228,7 +3231,8 @@ async function computeSceneDurations(movie, dir, included, overlap, titleShift) 
     sc.duration = Math.round(segDur * 100) / 100;
     sc.assembled = true;
     starts.push(cursor);
-    if (sc.narration) cues.push({ start: cursor, end: cursor + segDur - ov, text: sc.narration });
+    // the speaker's name is casting metadata, not something a viewer reads on screen
+    if (sc.narration) cues.push({ start: cursor, end: cursor + segDur - ov, text: captionText(sc.narration) });
     cursor += segDur - ov;
   }
   return { cues, starts, total: cursor + ov };

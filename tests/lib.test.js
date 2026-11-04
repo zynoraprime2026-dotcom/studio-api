@@ -73,3 +73,11 @@ test('clientAddress prefers the left-most forwarded address', () => {
   assert.strictEqual(clientAddress({ headers: {}, ip: '10.0.0.2' }), '10.0.0.2');
   assert.strictEqual(clientAddress({}), 'unknown');
 });
+
+test('a caption drops the speaker name the voice actor reads', () => {
+  const { captionText } = require('../lib/captions');
+  assert.strictEqual(captionText('Kofi: One more seam before I sleep.'), 'One more seam before I sleep.');
+  assert.strictEqual(captionText('The last light leaves Kumasi.'), 'The last light leaves Kumasi.');
+  assert.strictEqual(captionText('Sister Amina: We open at eight.'), 'We open at eight.');
+  assert.strictEqual(captionText('Note: bring the cloth.'), 'bring the cloth.');
+});

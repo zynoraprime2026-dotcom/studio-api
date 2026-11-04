@@ -3717,7 +3717,10 @@ app.post('/v1/movie/draft', async (req, res) => {
   try {
     draft = await groqMovieDraft(prompt, { style, language, duration, character, scenes: scenesWanted });
   } catch (e) {
-    return res.status(502).json({ error: 'shot list generation failed: ' + e.message, charged: true });
+    // a failed draft is not a delivered draft: give the use back so a provider
+    // outage cannot eat the monthly allowance
+    await addUsage(req.apiKey, -MOVIE_DRAFT_COST);
+    return res.status(502).json({ error: 'shot list generation failed: ' + e.message, charged: false, refunded: true });
   }
   // same respectful-content guard the render path applies, shown to the caller now
   for (const sc of draft.scenes) {

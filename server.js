@@ -536,9 +536,24 @@ app.post('/v1/admin/prune', async (req, res) => {
       await pool.query('DELETE FROM movie_assets WHERE movie_id = ANY($1::text[])', [doomedMovies.slice(i, i + 10)]);
     }
     await pool.query('DELETE FROM media WHERE created_at < NOW() - make_interval(days => $1)', [keepDays]);
+
+    // DELETE leaves the pages allocated, and a project at its ceiling cannot
+    // grow its way out. Truncate hands the space back to Postgres at once.
+    if (b.truncate_assets === true || b.truncateAssets === true) {
+      await pool.query('TRUNCATE movie_assets');
+      plan.truncated = 'movie_assets';
+    }
+    // and this is the only honest test of whether writes work again
+    let writable = null;
+    try {
+      await pool.query('CREATE TABLE IF NOT EXISTS write_probe (id INT PRIMARY KEY)');
+      await pool.query('INSERT INTO write_probe (id) VALUES ($1) ON CONFLICT DO NOTHING', [Date.now() % 100000]);
+      await pool.query('DROP TABLE IF EXISTS write_probe');
+      writable = true;
+    } catch (e) { writable = 'no: ' + String(e.message).slice(0, 140); }
     try { await pool.query('VACUUM movie_assets'); await pool.query('VACUUM media'); } catch (e) { /* neon may refuse offline; deletion already frees pages */ }
     const after = { movie_assets: Number(await sizeOf('movie_assets')), media: Number(await sizeOf('media')) };
-    res.json({ pruned: true, plan, after_bytes: after.movie_assets + after.media, freed_bytes: Math.max(0, plan.before_bytes - (after.movie_assets + after.media)) });
+    res.json({ pruned: true, plan, writable, after_bytes: after.movie_assets + after.media, freed_bytes: Math.max(0, plan.before_bytes - (after.movie_assets + after.media)) });
   } catch (e) {
     lastDbError = e.message;
     res.status(500).json({ error: 'prune failed: ' + String(e.message).slice(0, 200) });
@@ -4202,7 +4217,7 @@ function mvAssetKind(file) {
 }
 // The database is not a CDN: stop mirroring film binaries once the table is
 // fat, so the project cannot be filled to its ceiling again by one busy week.
-const ASSET_BUDGET_BYTES = Number(process.env.MOVIE_ASSET_BUDGET_MB || 600) * 1024 * 1024;
+const ASSET_BUDGET_BYTES = Number(process.env.MOVIE_ASSET_BUDGET_MB || 150) * 1024 * 1024;
 let assetBudget = { checked: 0, full: false };
 
 async function assetBudgetFull() {

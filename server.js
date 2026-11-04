@@ -3556,9 +3556,16 @@ async function assembleMovie(movie, dir, opts) {
     bodyPath = mixedPath;
   }
 
-  if (opts.brand) {
+  // `brand` never survived a restart (it is not a movies column), and films render
+  // across restarts, so the card silently vanished. Resolve from the saved kit when
+  // this run did not carry one, unless the film was explicitly born unbranded.
+  let cardBrand = opts.brand || movie.brand || null;
+  if (!cardBrand && !(movie.render && movie.render.brandOptOut) && movie.key) {
+    try { cardBrand = await brandGet(movie.key); } catch (e) { cardBrand = null; }
+  }
+  if (cardBrand) {
     const before = bodyPath;
-    const card = await appendBrandCard(dir, opts.brand, W, H, before);
+    const card = await appendBrandCard(dir, cardBrand, W, H, before);
     if (card.applied) {
       bodyPath = card.path;
       if (bodyPath !== before) { try { fs.unlinkSync(before); } catch (e) {} }
@@ -3845,6 +3852,7 @@ async function runMoviePipeline(movie, opts) {
       brand: movie.brand || opts.brand || null,
       onProgress: (f) => { movie.progress = Math.round(82 + 13 * f); }
     });
+    if (movie.brandCard) movie.render = { ...(movie.render || {}), brandCard: movie.brandCard };
     await mvSaveAsset(movie.id, 'final.mp4');
     await mvSaveAsset(movie.id, 'subtitles.vtt');
     movie.status = 'done';
@@ -4082,13 +4090,14 @@ app.post('/v1/movie/create', async (req, res) => {
     image: sc.image || sc.imageUrl || null,
   }));
   // brand: an explicit object wins, `brand: false` opts out, otherwise the saved kit
-  const brand = b.brand === false || b.brandCard === false
+  const brandOptOut = b.brand === false || b.brandCard === false;
+  const brand = brandOptOut
     ? null
     : (normalizeBrand(b.brand) || await brandGet(req.apiKey));
   const movie = {
     id, key: req.apiKey, title, status: 'queued', progress: 0, error: null,
     aspect, language, style, narratorVoice, duration: null, scenes: plannedScenes, continuity, brand,
-    render: { musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, style: look, rate, quality, seriesId: seriesRecord ? seriesRecord.id : null },
+    render: { musicUrl, musicVolume, burnSubtitles, titleCard, musicMood, crossfade, style: look, rate, quality, brandOptOut, seriesId: seriesRecord ? seriesRecord.id : null },
     createdAt: new Date().toISOString(),
     webhook: hook, baseUrl: 'https://' + req.get('host')
   };
@@ -4217,7 +4226,7 @@ app.get('/v1/movie/:id', async (req, res) => {
     duration: m.duration || null,
     language: m.language, style: m.style, aspectRatio: m.aspect, narratorVoice: m.narratorVoice,
     continuity: m.continuity || 'independent',
-    brandCard: m.brandCard || null,
+    brandCard: m.brandCard || (m.render && m.render.brandCard) || null,
     scenes: (m.scenes || []).map(s => ({
       id: s.id, imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration,
       narrationUrl: s.narrationUrl, visualPrompt: s.visualPrompt, contentGuard: s.contentGuard || null,

@@ -49,7 +49,8 @@ test('two calls: identity, then shots that begin with that identity', async () =
 
   assert.strictEqual(calls.length, 2);
   assert.strictEqual(calls[0].body.model, 'test-model');
-  assert.strictEqual(calls[0].body.response_format.type, 'json_object');
+  assert.strictEqual(calls[0].body.response_format, undefined, 'the first ask is a plain completion');
+  assert.strictEqual(calls[0].body.reasoning_effort, undefined, 'no reasoning hint for a non-reasoning model');
   assert.ok(calls[0].body.messages[0].content.includes(DIRECTOR_GUARD), 'the sacred-figure guard reaches the model');
   const shotPrompt = calls[1].body.messages[0].content;
   assert.ok(shotPrompt.includes(NATURAL_SPEECH), 'the spoken-language brief reaches the shot writer');
@@ -72,7 +73,7 @@ test('a JSON reply wrapped in prose is still read', async () => {
   assert.strictEqual(draft.title, 'The Compass of Zanj');
 });
 
-test('a failed JSON mode falls back to a plain completion', async () => {
+test('a plain completion runs first, with json mode as the retry', async () => {
   const calls = [];
   const impl = async (url, init) => {
     calls.push(JSON.parse(init.body));
@@ -82,7 +83,8 @@ test('a failed JSON mode falls back to a plain completion', async () => {
   const parsed = await groqChatJson([{ role: 'user', content: 'x' }], { apiKey: 'k', fetchImpl: impl });
   assert.strictEqual(parsed.title, 'The Compass of Zanj');
   assert.strictEqual(calls.length, 2);
-  assert.strictEqual(calls[1].response_format, undefined, 'the retry drops json mode');
+  assert.strictEqual(calls[0].response_format, undefined, 'the plain attempt comes first');
+  assert.strictEqual(calls[1].response_format.type, 'json_object', 'json mode is the retry');
 });
 
 test('an unreadable reply is an error, not a silent empty draft', async () => {

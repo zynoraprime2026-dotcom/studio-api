@@ -3128,20 +3128,55 @@ async function movieI2VClip(imageUrl, prompt, duration, onTick) {
   return { videoUrl, model: usedModel };
 }
 
-async function movieKenBurns(imgPath, outPath, duration, W, H) {
+// A still becomes footage by moving the camera, not by sliding it. One zoompan
+// gives every shot the same centred push, which reads as a slideshow; here each
+// shot gets an eased move and its own direction, so a cut changes the framing
+// the way a second camera setup would. Everything stays single-threaded and
+// ultrafast because this box has 512MB and assembly already lives close to it.
+const CAMERA_MOVES = [
+  { name: 'push-right', z0: 1.03, z1: 1.26, dx: 0.075, dy: 0 },
+  { name: 'pull-left', z0: 1.26, z1: 1.02, dx: -0.075, dy: 0 },
+  { name: 'truck-right', z0: 1.14, z1: 1.19, dx: -0.10, dy: 0 },
+  { name: 'tilt-up', z0: 1.12, z1: 1.20, dx: 0, dy: 0.085 },
+  { name: 'diagonal-in', z0: 1.03, z1: 1.24, dx: 0.06, dy: -0.05 },
+  { name: 'settle-down', z0: 1.22, z1: 1.10, dx: -0.05, dy: 0.06 }
+];
+
+function cameraMoveFor(seed) {
+  const t = String(seed == null ? '' : seed);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return CAMERA_MOVES[h % CAMERA_MOVES.length];
+}
+
+async function movieKenBurns(imgPath, outPath, duration, W, H, seed) {
   const FPS = 30;
-  const N = Math.round(duration * FPS);
-  const z = 'min(1+' + (0.22 / N).toFixed(6) + '*in,1.22)';
+  const N = Math.max(1, Math.round(duration * FPS));
+  const move = cameraMoveFor(seed === undefined ? imgPath : seed);
+  const OVER = 1.45; // overscan so a drift never shows an edge
+  const SW = Math.round(W * OVER), SH = Math.round(H * OVER);
+  // eased progress: cosine in-out, no visible start or stop jolt
+  const p = '(1-cos(PI*on/' + N + '))/2';
+  const zoom = '(' + move.z0.toFixed(4) + '+(' + (move.z1 - move.z0).toFixed(4) + ')*' + p + ')';
+  const dx = Math.round(move.dx * W);
+  const dy = Math.round(move.dy * H);
+  const x = 'iw/2-(iw/zoom/2)' + (dx ? '+' + dx + '*' + p : '');
+  const y = 'ih/2-(ih/zoom/2)' + (dy ? '+' + dy + '*' + p : '');
   const vf = [
-    'scale=' + Math.round(W * 1.3) + ':' + Math.round(H * 1.3) + ':force_original_aspect_ratio=increase',
-    'crop=' + Math.round(W * 1.3) + ':' + Math.round(H * 1.3),
-    "zoompan=z='" + z + "':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=" + W + 'x' + H + ':fps=' + FPS,
+    'scale=' + SW + ':' + SH + ':force_original_aspect_ratio=increase',
+    'crop=' + SW + ':' + SH,
+    "zoompan=z='" + zoom + "':x='" + x + "':y='" + y + "':d=1:s=" + W + 'x' + H + ':fps=' + FPS,
+    // a hint of lens falloff and grain: the two things that most separate
+    // "photo being scrolled" from "camera rolling"
+    'vignette=PI/4.6',
+    'noise=alls=4:allf=t',
     'format=yuv420p'
   ];
   await execFileAsync('ffmpeg', ['-y', '-threads', '1', '-filter_threads', '1', '-loop', '1', '-framerate', String(FPS),
     '-t', String(duration), '-i', imgPath, '-vf', vf.join(','), '-r', String(FPS),
     '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-pix_fmt', 'yuv420p', outPath],
     { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
+  movieKenBurns.lastMove = move.name;
 }
 
 // ---------- step 5: subtitles (WebVTT timed to narration length) ----------
@@ -3830,7 +3865,7 @@ async function runMoviePipeline(movie, opts) {
           }
         }
         if (!out.clipSource) {
-          await retryOnce(() => movieKenBurns(imgPath, clipPath, 5, W, H), 2000);
+          await retryOnce(() => movieKenBurns(imgPath, clipPath, 5, W, H, i), 2000);
           out.clipSource = 'ken_burns';
           if (tier === 'storyboard') out.note = 'storyboard pass: stills only, no video model was called';
         }
@@ -4818,7 +4853,7 @@ async function reShootScene(m, idx, patch) {
       console.error('re-shoot scene ' + (idx + 1) + ' i2v failed, using Ken Burns:', e.message);
     }
   }
-  if (!clipSource) { await retryOnce(() => movieKenBurns(f.img, f.clip, 5, W, H), 2000); clipSource = 'ken_burns'; }
+  if (!clipSource) { await retryOnce(() => movieKenBurns(f.img, f.clip, 5, W, H, idx), 2000); clipSource = 'ken_burns'; }
   await mvSaveAsset(m.id, 'clip' + idx + '.mp4');
 
   // 5. narration at the requested pace

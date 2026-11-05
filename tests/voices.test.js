@@ -45,3 +45,10 @@ test('Arabic films cast from the Arabic pool', () => {
   assert.match(v, /^ar-/);
   assert.notStrictEqual(v, 'ar-SA-HamedNeural');
 });
+
+test('a one-word line is still dialogue, not the narrator reading a name', () => {
+  const r = spokenLine('Ananse: Oops.', 'en-US-GuyNeural', 'English');
+  assert.strictEqual(r.speaker, 'Ananse');
+  assert.strictEqual(r.text, 'Oops.');
+  assert.notStrictEqual(r.voice, 'en-US-GuyNeural');
+});

@@ -3708,11 +3708,17 @@ async function assembleMovie(movie, dir, opts) {
   try {
     await execFileAsync('ffmpeg', ['-y', '-i', bodyPath, '-i', path.join(dir, 'subtitles.vtt'),
       '-map', '0', '-map', '1', '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text',
-      '-metadata:s:s:0', 'language=' + movieLangCode(movie.language), finalPath],
+      '-metadata:s:s:0', 'language=' + movieLangCode(movie.language),
+      // without this the index sits at the end of the file and a phone has to pull
+      // all 8MB before the first frame, which is the spinner that never resolves
+      '-movflags', '+faststart', finalPath],
       { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
   } catch (e) {
     console.error('movie subtitle mux failed, shipping without embedded subs:', e.message);
-    fs.copyFileSync(bodyPath, finalPath);
+    try {
+      await execFileAsync('ffmpeg', ['-y', '-i', bodyPath, '-c', 'copy', '-movflags', '+faststart', finalPath],
+        { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
+    } catch (e2) { fs.copyFileSync(bodyPath, finalPath); }
     movie.subtitleNote = 'subtitles available at /v1/movie/' + movie.id + '/subtitles (embedding failed: ' + e.message + ')';
   }
   for (const f of segFiles) { try { fs.unlinkSync(f); } catch (e) {} }

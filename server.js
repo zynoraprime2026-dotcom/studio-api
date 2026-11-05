@@ -4414,10 +4414,11 @@ app.get('/v1/movie/list', async (req, res) => {
 app.post('/v1/movie/:id/remux', async (req, res) => {
   const m = await mvOwn(req.params.id, req.apiKey);
   if (!m) return res.status(404).json({ error: 'movie not found' });
-  const dir = path.join(MOVIE_DIR, m.id);
-  const finalPath = path.join(dir, 'final.mp4');
-  if (!fs.existsSync(finalPath)) return res.status(404).json({ error: 'the cut is no longer on disk; create a new film' });
-  const tmp = path.join(dir, 'final-reindex.mp4');
+  // the cut is not always at MOVIE_DIR/<id>/final.mp4, so locate it the same way the
+  // download route does instead of guessing the path
+  const finalPath = await movieAssetOnDisk(m.id, 'final.mp4');
+  if (!finalPath) return res.status(404).json({ error: 'the cut is no longer on disk; create a new film' });
+  const tmp = finalPath.replace(/final\.mp4$/, 'final-reindex.mp4');
   try {
     await execFileAsync('ffmpeg', ['-y', '-i', finalPath, '-c', 'copy', '-movflags', '+faststart', tmp],
       { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });

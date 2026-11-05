@@ -3999,6 +3999,7 @@ async function runMoviePipeline(movie, opts) {
     });
     if (movie.brandCard) movie.render = { ...(movie.render || {}), brandCard: movie.brandCard };
     await mvSaveAsset(movie.id, 'final.mp4');
+    try { await publishToR2(movie); } catch (e) { console.error('R2 publish failed:', e.message); }
     await mvSaveAsset(movie.id, 'subtitles.vtt');
     movie.status = 'done';
     movie.progress = 100;
@@ -4408,6 +4409,20 @@ app.get('/v1/movie/list', async (req, res) => {
   res.json({ movies: mine.map(m => ({ id: m.id, title: m.title, status: m.status, aspectRatio: m.aspect, duration: m.duration, created_at: m.createdAt })) });
 });
 
+// POST /v1/movie/:id/publish -> free. Puts an existing cut into R2 and stores the key.
+app.post('/v1/movie/:id/publish', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  if (!r2Ready()) return res.status(503).json({ error: 'R2 is not configured: set R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY' });
+  try {
+    const key = await publishToR2(m);
+    if (!key) return res.status(404).json({ error: 'the cut is no longer on disk; create a new film' });
+    return res.json({ movie_id: m.id, filmKey: key, url: r2Url(key, 3600) });
+  } catch (e) {
+    return res.status(502).json({ error: e.message });
+  }
+});
+
 // POST /v1/movie/:id/playable -> free. Re-encodes an old cut to H.264 High/yuv420p
 // and re-indexes it. 4:4:4 films download fine and play nowhere on a phone.
 app.post('/v1/movie/:id/playable', async (req, res) => {
@@ -4432,7 +4447,9 @@ app.post('/v1/movie/:id/playable', async (req, res) => {
     try { fs.unlinkSync(tmp); } catch (e2) {}
     return res.status(502).json({ error: 'could not convert the cut: ' + e.message });
   }
-  return res.json({ movie_id: m.id, changed: true, from: info.pix_fmt || null, pix_fmt: 'yuv420p', bytes: fs.statSync(finalPath).size });
+  let published = null;
+  try { published = await publishToR2(m); } catch (e) { console.error('R2 publish failed:', e.message); }
+  return res.json({ movie_id: m.id, changed: true, from: info.pix_fmt || null, pix_fmt: 'yuv420p', published, bytes: fs.statSync(finalPath).size });
 });
 
 // POST /v1/movie/:id/remux -> free. Rewrites an existing cut with the index at the
@@ -4569,11 +4586,106 @@ function movieFilePath(m, name) {
   return p;
 }
 
+// ---- durable film storage: Cloudflare R2 -------------------------------------
+// The free Render instance has no disk, so every deploy deletes finished films.
+// The cut is uploaded to R2 at assembly and the key is stored on the movie, so
+// the film outlives the box and streams straight from Cloudflare.
+const r2crypto = require('crypto');
+const R2 = {
+  bucket: process.env.R2_BUCKET || '',
+  account: process.env.R2_ACCOUNT_ID || '',
+  keyId: process.env.R2_ACCESS_KEY_ID || '',
+  secret: process.env.R2_SECRET_ACCESS_KEY || '',
+  publicBase: process.env.R2_PUBLIC_BASE || '',
+};
+
+function r2Ready() { return !!(R2.bucket && R2.account && R2.keyId && R2.secret); }
+function r2Host() { return R2.account + '.r2.cloudflarestorage.com'; }
+function r2Hmac(key, data) { return r2crypto.createHmac('sha256', key).update(data).digest(); }
+function r2Sha(data) { return r2crypto.createHash('sha256').update(data).digest('hex'); }
+function r2AmzDate() { return new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''); }
+function r2SigningKey(stamp) {
+  return r2Hmac(r2Hmac(r2Hmac(r2Hmac('AWS4' + R2.secret, stamp), 'auto'), 's3'), 'aws4_request');
+}
+
+async function r2Put(key, body, contentType) {
+  if (!r2Ready()) throw new Error('R2 is not configured');
+  const amzDate = r2AmzDate();
+  const stamp = amzDate.slice(0, 8);
+  const host = r2Host();
+  const payloadHash = r2Sha(body);
+  const type = contentType || 'application/octet-stream';
+  const canonicalHeaders = 'content-type:' + type + '\nhost:' + host +
+    '\nx-amz-content-sha256:' + payloadHash + '\nx-amz-date:' + amzDate + '\n';
+  const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
+  const canonicalRequest = ['PUT', '/' + R2.bucket + '/' + key, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const scope = stamp + '/auto/s3/aws4_request';
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, r2Sha(canonicalRequest)].join('\n');
+  const signature = r2crypto.createHmac('sha256', r2SigningKey(stamp)).update(stringToSign).digest('hex');
+  const res = await fetch('https://' + host + '/' + R2.bucket + '/' + key, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': type,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
+      Authorization: 'AWS4-HMAC-SHA256 Credential=' + R2.keyId + '/' + scope +
+        ', SignedHeaders=' + signedHeaders + ', Signature=' + signature,
+    },
+    body,
+    signal: AbortSignal.timeout(20 * 60 * 1000),
+  });
+  if (!res.ok) throw new Error('R2 upload failed: HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
+  return key;
+}
+
+function r2Presign(key, expiresSeconds) {
+  const amzDate = r2AmzDate();
+  const stamp = amzDate.slice(0, 8);
+  const host = r2Host();
+  const scope = stamp + '/auto/s3/aws4_request';
+  const query = [
+    'X-Amz-Algorithm=AWS4-HMAC-SHA256',
+    'X-Amz-Credential=' + encodeURIComponent(R2.keyId + '/' + scope),
+    'X-Amz-Date=' + amzDate,
+    'X-Amz-Expires=' + String(expiresSeconds || 3600),
+    'X-Amz-SignedHeaders=host',
+  ].join('&');
+  const canonicalRequest = ['GET', '/' + R2.bucket + '/' + key, query, 'host:' + host + '\n', 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, r2Sha(canonicalRequest)].join('\n');
+  const signature = r2crypto.createHmac('sha256', r2SigningKey(stamp)).update(stringToSign).digest('hex');
+  return 'https://' + host + '/' + R2.bucket + '/' + key + '?' + query + '&X-Amz-Signature=' + signature;
+}
+
+function r2Url(key, expiresSeconds) {
+  if (!key) return null;
+  if (R2.publicBase) return R2.publicBase.replace(/\/+$/, '') + '/' + key;
+  if (!r2Ready()) return null;
+  return r2Presign(key, expiresSeconds);
+}
+
+// best effort: a film that cannot be uploaded still exists on the box until the next restart
+async function publishToR2(m) {
+  if (!r2Ready() || !m || !m.id) return null;
+  const p = await movieAssetOnDisk(m.id, 'final.mp4');
+  if (!p) return null;
+  const key = 'films/' + m.id + '/final.mp4';
+  await r2Put(key, fs.readFileSync(p), 'video/mp4');
+  m.render = Object.assign({}, m.render || {}, { filmKey: key, filmPublishedAt: new Date().toISOString() });
+  await mvSave(m);
+  console.log('film published to R2:', key);
+  return key;
+}
+
 app.get('/v1/movie/:id/file', async (req, res) => {
   const m = await mvOwn(req.params.id, req.apiKey);
   if (!m) return res.status(404).json({ error: 'movie not found' });
   if (m.status !== 'done') return res.status(404).json({ error: 'movie not ready (status: ' + m.status + ')' });
   const p = await movieAssetOnDisk(m.id, 'final.mp4');
+  if (!p) {
+    // the box was recycled; if the cut was published, send the player to Cloudflare
+    const durable = r2Url(m.render && m.render.filmKey, 3600);
+    if (durable) { res.setHeader('Cache-Control', 'no-store'); return res.redirect(302, durable); }
+  }
   if (!p) return res.status(404).json({ error: 'movie file missing (disk may have been recycled — rebuild from scene assets)' });
   // A phone asks for a byte range before it will show frame one. Answering 200 with
   // the whole body leaves the player on a spinner, so ranges are served properly.

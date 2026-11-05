@@ -2975,7 +2975,10 @@ async function groqMovieScenes(story, style, language, maxScenes) {
   for (const useJson of [false, true]) {
     try {
       // budget the answer by shot count: a 5-shot list is short JSON, not a novel
-      const body = { model: GROQ_MODEL, messages, temperature: 0.6, max_tokens: Math.min(2400, 600 + Math.max(1, target) * 180) };
+      const body = { model: GROQ_MODEL, messages, temperature: 0.6, max_tokens: Math.min(6000, 1500 + Math.max(1, target) * 300) };
+      // gpt-oss reasons before it answers, and that reasoning is billed against
+      // max_tokens: an empty answer with finish_reason "length" is the usual result
+      if (/gpt-oss/i.test(String(GROQ_MODEL))) body.reasoning_effort = 'low';
       if (useJson) body.response_format = { type: 'json_object' };
       const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
@@ -2984,12 +2987,13 @@ async function groqMovieScenes(story, style, language, maxScenes) {
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error((d.error && d.error.message) || 'Groq request failed');
-      const txt = d.choices[0].message.content;
+      const txt = (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '';
+      if (!txt) throw new Error('the model returned nothing (finish_reason ' + ((d.choices && d.choices[0] && d.choices[0].finish_reason) || 'unknown') + ')');
       rawText = txt;
       parsed = parseLooseJson(txt);
       if (parsed && !Array.isArray(parsed.scenes) && Array.isArray(parsed)) parsed = { scenes: parsed };
       if (parsed && parsed.scenes && !Array.isArray(parsed.scenes) && parsed.scenes.scenes) parsed = parsed.scenes;
-      if (parsed && Array.isArray(parsed.scenes) && parsed.scenes.length) return parsed;
+      if (parsed && Array.isArray(parsed.scenes) && parsed.scenes.length) return parsed.scenes;
       throw new Error('script JSON could not be parsed');
     } catch (e) { lastErr = e; }
   }
@@ -3010,9 +3014,22 @@ async function groqMovieScenes(story, style, language, maxScenes) {
       });
       const d = await r.json().catch(() => ({}));
       const fixed = parseLooseJson(d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content);
-      if (fixed && Array.isArray(fixed.scenes) && fixed.scenes.length) return fixed;
+      if (fixed && Array.isArray(fixed.scenes) && fixed.scenes.length) return fixed.scenes;
     } catch (e) { lastErr = e; }
   }
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'StudioAPI/1.0' },
+      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages, temperature: 0.6, max_tokens: Math.min(6000, 1500 + Math.max(1, target) * 300) })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const alt = parseLooseJson(d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content);
+      if (alt && Array.isArray(alt.scenes) && alt.scenes.length) return alt.scenes;
+      if (alt && Array.isArray(alt)) return alt;
+    }
+  } catch (e) { lastErr = e; }
   throw new Error((lastErr ? lastErr.message : 'script generation failed') + (rawText ? ' | model said: ' + String(rawText).replace(/\s+/g, ' ').slice(0, 160) : ' | model said nothing'));
 }
 

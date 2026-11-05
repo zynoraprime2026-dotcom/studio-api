@@ -3195,6 +3195,7 @@ function vttTimestamp(s) {
 const { captionText } = require('./lib/captions');
 const { normalizeBrand, brandCardFilters } = require('./lib/brand');
 const { parseLooseJson } = require('./lib/loose-json');
+const { applyCast, castToBible, castFromBible, normalizeCast } = require('./lib/cast-lock');
 
 function buildVtt(cues) {
   return 'WEBVTT\n\n' + cues.map((c, i) =>
@@ -3250,6 +3251,35 @@ async function groqCharacterBlock(story, title) {
     const t = String((d.choices && d.choices[0] && d.choices[0].message.content) || '').trim();
     return t ? t.slice(0, 400) : null;
   } catch (e) { return null; }
+}
+
+// One entry per person, not one paragraph for everyone: a lone shot must not be
+// told about the other characters, and episode two has to start from the same faces.
+async function groqCast(story, title) {
+  const key = process.env.GROQ_API_KEY;
+  if (!key || !story) return [];
+  try {
+    const sys = 'List the reusable visual identities for this film. Reply with ONLY JSON: ' +
+      '{"cast":[{"name":"...","description":"..."}]}. One entry per named character that speaks or appears. ' +
+      'description: age, build, clothing colours and ONE distinctive feature, max 30 words, no real or sacred figures. ' +
+      'Use the names exactly as the story spells them.';
+    const body = { model: GROQ_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: (title ? 'Title: ' + title + '. ' : '') + 'Story: ' + String(story).slice(0, 3000) }], temperature: 0.3, max_tokens: 900 };
+    if (/gpt-oss/i.test(String(GROQ_MODEL))) body.reasoning_effort = 'low';
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'StudioAPI/1.0' }, body: JSON.stringify(body)
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) return [];
+    const parsed = parseLooseJson(d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content);
+    return normalizeCast(parsed && parsed.cast);
+  } catch (e) { return []; }
+}
+
+async function seriesAppendCast(key, seriesId, line) {
+  if (!line || !pool) return;
+  try {
+    await pool.query('UPDATE series SET bible = COALESCE(bible, \'\') || $1 WHERE id = $2 AND key = $3', ['\n' + line, seriesId, key]);
+  } catch (e) { console.error('series cast save failed:', e.message); }
 }
 
 // ---------- bundled mood music (royalty-free by construction: synthesized) ----------
@@ -3723,10 +3753,20 @@ async function runMoviePipeline(movie, opts) {
     // a seed derived from that block so all scenes share the same visual identity.
     // On resume the block is already baked into the stored prompts.
     if (!opts.resume) {
-      const characterBlock = await groqCharacterBlock(opts.story, movie.title);
-      if (characterBlock) {
-        movie.characterBlock = characterBlock;
-        for (const sc of scenes) if (sc.visualPrompt) sc.visualPrompt = (characterBlock + ', ' + sc.visualPrompt).slice(0, 700);
+      const inherited = castFromBible(opts.bible || (movie.render && movie.render.bible) || '');
+      const cast = inherited.length ? inherited : await groqCast(opts.story, movie.title);
+      if (cast.length) {
+        movie.cast = cast;
+        applyCast(scenes, cast).forEach((sc, i) => { scenes[i] = sc; });
+        movie.characterBlock = cast.map((c) => c.description).join('; ').slice(0, 400);
+        const seriesId = movie.render && movie.render.seriesId;
+        if (seriesId && !inherited.length) await seriesAppendCast(movie.key, seriesId, castToBible(cast));
+      } else {
+        const characterBlock = await groqCharacterBlock(opts.story, movie.title);
+        if (characterBlock) {
+          movie.characterBlock = characterBlock;
+          for (const sc of scenes) if (sc.visualPrompt) sc.visualPrompt = (characterBlock + ', ' + sc.visualPrompt).slice(0, 700);
+        }
       }
     }
     const movieSeed = movieSeedFromText(movie.characterBlock || movie.title || movie.id);
@@ -4376,6 +4416,7 @@ app.get('/v1/movie/:id', async (req, res) => {
     language: m.language, style: m.style, aspectRatio: m.aspect, narratorVoice: m.narratorVoice,
     continuity: m.continuity || 'independent',
     brandCard: m.brandCard || (m.render && m.render.brandCard) || null,
+    cast: Array.isArray(m.cast) ? m.cast : [],
     scenes: (m.scenes || []).map(s => ({
       id: s.id, imageUrl: s.imageUrl, clipUrl: s.clipUrl, narration: s.narration,
       narrationUrl: s.narrationUrl, visualPrompt: s.visualPrompt, contentGuard: s.contentGuard || null,

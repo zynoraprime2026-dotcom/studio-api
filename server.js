@@ -4408,6 +4408,27 @@ app.get('/v1/movie/list', async (req, res) => {
   res.json({ movies: mine.map(m => ({ id: m.id, title: m.title, status: m.status, aspectRatio: m.aspect, duration: m.duration, created_at: m.createdAt })) });
 });
 
+// POST /v1/movie/:id/remux -> free. Rewrites an existing cut with the index at the
+// front. Films made before faststart existed cannot be re-assembled once the scene
+// clips are gone, but their final.mp4 is still on disk and only needs re-indexing.
+app.post('/v1/movie/:id/remux', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const dir = path.join(MOVIE_DIR, m.id);
+  const finalPath = path.join(dir, 'final.mp4');
+  if (!fs.existsSync(finalPath)) return res.status(404).json({ error: 'the cut is no longer on disk; create a new film' });
+  const tmp = path.join(dir, 'final-reindex.mp4');
+  try {
+    await execFileAsync('ffmpeg', ['-y', '-i', finalPath, '-c', 'copy', '-movflags', '+faststart', tmp],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 5 * 60 * 1000 });
+    fs.renameSync(tmp, finalPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+    return res.status(502).json({ error: 'could not re-index the cut: ' + e.message });
+  }
+  return res.json({ movie_id: m.id, faststart: true, bytes: fs.statSync(finalPath).size });
+});
+
 app.get('/v1/movie/:id', async (req, res) => {
   const m = await mvOwn(req.params.id, req.apiKey);
   if (!m) return res.status(404).json({ error: 'movie not found' });

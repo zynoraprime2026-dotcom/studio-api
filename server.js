@@ -439,7 +439,7 @@ async function isValidKey(key) {
 }
 
 // ---------- usage metering (free tier) ----------
-const FREE_MONTHLY_LIMIT = parseInt(process.env.FREE_MONTHLY_LIMIT) || 100;
+const FREE_MONTHLY_LIMIT = parseInt(process.env.FREE_MONTHLY_LIMIT) || 2000;
 const memoryUsage = new Map(); // key -> { month, count }
 function currentMonth() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
 
@@ -757,7 +757,11 @@ app.use('/v1', async (req, res, next) => {
 
 app.get('/v1/usage', async (req, res) => {
   const { month, used } = await getUsage(req.headers['x-api-key'] || '');
-  res.json({ month, used, limit: FREE_MONTHLY_LIMIT, remaining: Math.max(0, FREE_MONTHLY_LIMIT - used),
+  const owner = isOwnerKey(req.headers['x-api-key'] || '');
+  res.json({ month, used, limit: owner ? 'unlimited (owner)' : FREE_MONTHLY_LIMIT,
+    remaining: owner ? 'unlimited (owner)' : Math.max(0, FREE_MONTHLY_LIMIT - used),
+    owner,
+    daily: { films: owner ? 'unlimited (owner)' : MOVIE_DAILY_LIMIT, shot_lists: owner ? 'unlimited (owner)' : MOVIE_DRAFT_DAILY_LIMIT },
     movie_costs: { storyboard: MOVIE_STORYBOARD_COST, standard: MOVIE_USAGE_COST, high: MOVIE_HIGH_COST },
     draft_cost: MOVIE_DRAFT_COST });
 });
@@ -2769,10 +2773,12 @@ app.post('/v1/masjid/answer', async (req, res) => {
 const MOVIE_USAGE_COST = parseInt(process.env.MOVIE_USAGE_COST) || 20;
 const MOVIE_STORYBOARD_COST = parseInt(process.env.MOVIE_STORYBOARD_COST) || 4;
 const MOVIE_HIGH_COST = parseInt(process.env.MOVIE_HIGH_COST) || 30;
-const MOVIE_DAILY_LIMIT = parseInt(process.env.MOVIE_DAILY_LIMIT) || 3;
+const MOVIE_DAILY_LIMIT = parseInt(process.env.MOVIE_DAILY_LIMIT) || 40;
+const OWNER_API_KEY = (process.env.OWNER_API_KEY || '').trim();
+const isOwnerKey = (key) => !!OWNER_API_KEY && String(key || '') === OWNER_API_KEY;
 const MOVIE_MAX_SCENES = parseInt(process.env.MOVIE_MAX_SCENES) || 12;
 const MOVIE_DIR = path.join(WORK_DIR, 'movies'); // WORK_DIR=/data on Render (persistent disk)
-const MOVIE_DRAFT_DAILY_LIMIT = parseInt(process.env.MOVIE_DRAFT_DAILY_LIMIT) || 30;
+const MOVIE_DRAFT_DAILY_LIMIT = parseInt(process.env.MOVIE_DRAFT_DAILY_LIMIT) || 200;
 const MOVIE_DRAFT_TTL_HOURS = parseInt(process.env.MOVIE_DRAFT_TTL_HOURS) || 168; // 7 days
 const MOVIE_DRAFT_COST = parseInt(process.env.MOVIE_DRAFT_COST) || 1;
 const MOVIE_RESHOOT_COST = parseInt(process.env.MOVIE_RESHOOT_COST) || 1;
@@ -3688,7 +3694,7 @@ async function assembleMovie(movie, dir, opts) {
 // light metering for the companion endpoints (script preview, assembly retry)
 async function chargeUse(key, n) {
   const { used } = await getUsage(key);
-  if (used + n > FREE_MONTHLY_LIMIT) return false;
+  if (!isOwnerKey(key) && used + n > FREE_MONTHLY_LIMIT) return false;
   await addUsage(key, n);
   return true;
 }
@@ -4000,7 +4006,7 @@ app.post('/v1/movie/draft', async (req, res) => {
   const scenesWanted = isFinite(wanted) ? Math.min(Math.max(4, wanted), MOVIE_MAX_SCENES) : Math.min(MOVIE_MAX_SCENES, 5);
 
   const daily = await mvDraftDailyUsed(req.apiKey);
-  if (daily.count >= MOVIE_DRAFT_DAILY_LIMIT) {
+  if (daily.count >= MOVIE_DRAFT_DAILY_LIMIT && !isOwnerKey(req.apiKey)) {
     return res.status(429).json({ error: 'Rate limit: ' + MOVIE_DRAFT_DAILY_LIMIT + ' shot lists per key per day. Try again tomorrow.', used_today: daily.count, limit: MOVIE_DRAFT_DAILY_LIMIT });
   }
   if (!(await chargeUse(req.apiKey, MOVIE_DRAFT_COST))) {
@@ -4158,7 +4164,7 @@ app.post('/v1/movie/create', async (req, res) => {
 
   // daily rate limit: 3 movie creates per key per day
   const daily = await movieDailyUsed(req.apiKey);
-  if (daily.count >= MOVIE_DAILY_LIMIT) {
+  if (daily.count >= MOVIE_DAILY_LIMIT && !isOwnerKey(req.apiKey)) {
     return res.status(429).json({ error: 'Rate limit: ' + MOVIE_DAILY_LIMIT + ' movie creations per key per day. Try again tomorrow.', used_today: daily.count, limit: MOVIE_DAILY_LIMIT });
   }
 

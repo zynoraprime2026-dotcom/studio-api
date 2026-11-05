@@ -1163,9 +1163,9 @@ app.post('/v1/video/render', async (req, res) => {
           const args = ['-y', ...baseInput];
           const vfFull = (sc.image ? vf.join(',') + ',' : '') + parts.join(',');
           if (narrPath) {
-            args.push('-i', narrPath, '-vf', vfFull, '-t', String(dur), '-af', 'apad', '-threads', '1', '-filter_threads', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-c:a', 'aac', '-b:a', '128k', '-shortest', seg);
+            args.push('-i', narrPath, '-vf', vfFull, '-t', String(dur), '-af', 'apad', '-threads', '1', '-filter_threads', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-level', '4.0', '-c:a', 'aac', '-b:a', '128k', '-shortest', seg);
           } else {
-            args.push('-vf', vfFull, '-t', String(dur), '-threads', '1', '-filter_threads', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', seg);
+            args.push('-vf', vfFull, '-t', String(dur), '-threads', '1', '-filter_threads', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1', '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-level', '4.0', seg);
           }
           await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10, timeout: 10 * 60 * 1000 });
           segFiles.push(seg);
@@ -4406,6 +4406,33 @@ app.get('/v1/movie/list', async (req, res) => {
   }
   const mine = [...memoryMovies.values()].filter(m => m.key === req.apiKey).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)).slice(0, 50);
   res.json({ movies: mine.map(m => ({ id: m.id, title: m.title, status: m.status, aspectRatio: m.aspect, duration: m.duration, created_at: m.createdAt })) });
+});
+
+// POST /v1/movie/:id/playable -> free. Re-encodes an old cut to H.264 High/yuv420p
+// and re-indexes it. 4:4:4 films download fine and play nowhere on a phone.
+app.post('/v1/movie/:id/playable', async (req, res) => {
+  const m = await mvOwn(req.params.id, req.apiKey);
+  if (!m) return res.status(404).json({ error: 'movie not found' });
+  const finalPath = await movieAssetOnDisk(m.id, 'final.mp4');
+  if (!finalPath) return res.status(404).json({ error: 'the cut is no longer on disk; create a new film' });
+  const probe = await execFileAsync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=pix_fmt,profile', '-of', 'json', finalPath], { maxBuffer: 1024 * 1024 });
+  let info = {};
+  try { info = (JSON.parse(probe.stdout).streams || [])[0] || {}; } catch (e) {}
+  if (info.pix_fmt === 'yuv420p' && /Main|Baseline|High$/.test(String(info.profile || ''))) {
+    return res.json({ movie_id: m.id, changed: false, pix_fmt: info.pix_fmt, profile: info.profile });
+  }
+  const tmp = finalPath.replace(/final\.mp4$/, 'final-playable.mp4');
+  try {
+    await execFileAsync('ffmpeg', ['-y', '-i', finalPath, '-threads', '1', '-filter_threads', '1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-x264-params', 'rc-lookahead=0:ref=1',
+      '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-level', '4.0', '-c:a', 'copy',
+      '-movflags', '+faststart', tmp], { maxBuffer: 1024 * 1024 * 10, timeout: 15 * 60 * 1000 });
+    fs.renameSync(tmp, finalPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+    return res.status(502).json({ error: 'could not convert the cut: ' + e.message });
+  }
+  return res.json({ movie_id: m.id, changed: true, from: info.pix_fmt || null, pix_fmt: 'yuv420p', bytes: fs.statSync(finalPath).size });
 });
 
 // POST /v1/movie/:id/remux -> free. Rewrites an existing cut with the index at the

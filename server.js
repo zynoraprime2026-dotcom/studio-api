@@ -4548,8 +4548,26 @@ app.get('/v1/movie/:id/file', async (req, res) => {
   if (m.status !== 'done') return res.status(404).json({ error: 'movie not ready (status: ' + m.status + ')' });
   const p = await movieAssetOnDisk(m.id, 'final.mp4');
   if (!p) return res.status(404).json({ error: 'movie file missing (disk may have been recycled — rebuild from scene assets)' });
+  // A phone asks for a byte range before it will show frame one. Answering 200 with
+  // the whole body leaves the player on a spinner, so ranges are served properly.
+  const total = fs.statSync(p).size;
+  const range = String(req.headers.range || '');
+  const m2 = range.match(/bytes=(\d*)-(\d*)/);
   res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', 'attachment; filename="' + m.title.replace(/[^\w.-]+/g, '_').slice(0, 60) + '.mp4"');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Disposition', (req.query.download === '1' ? 'attachment' : 'inline') + '; filename="' + m.title.replace(/[^\w.-]+/g, '_').slice(0, 60) + '.mp4"');
+  if (m2) {
+    let start = m2[1] === '' ? Math.max(0, total - parseInt(m2[2] || 0, 10)) : parseInt(m2[1], 10);
+    let end = m2[1] === '' || m2[2] === '' ? total - 1 : Math.min(parseInt(m2[2], 10), total - 1);
+    if (!isFinite(start) || start < 0) start = 0;
+    if (!isFinite(end) || end >= total) end = total - 1;
+    if (start > end) { res.status(416).setHeader('Content-Range', 'bytes */' + total); return res.end(); }
+    res.status(206);
+    res.setHeader('Content-Range', 'bytes ' + start + '-' + end + '/' + total);
+    res.setHeader('Content-Length', String(end - start + 1));
+    return fs.createReadStream(p, { start, end }).pipe(res);
+  }
+  res.setHeader('Content-Length', String(total));
   fs.createReadStream(p).pipe(res);
 });
 

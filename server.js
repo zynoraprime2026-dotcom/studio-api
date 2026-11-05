@@ -2971,7 +2971,8 @@ async function groqMovieScenes(story, style, language, maxScenes) {
   const messages = [{ role: 'system', content: sys }, { role: 'user', content: 'Story: ' + story + (style ? '\nOverall visual style: ' + style : '') }];
   let parsed = null, lastErr = null;
   // attempt 1: JSON mode; attempt 2 (fallback): plain completion (in case JSON mode is rejected)
-  for (const useJson of [true, false]) {
+  let rawText = null;
+  for (const useJson of [false, true]) {
     try {
       // budget the answer by shot count: a 5-shot list is short JSON, not a novel
       const body = { model: GROQ_MODEL, messages, temperature: 0.6, max_tokens: Math.min(2400, 600 + Math.max(1, target) * 180) };
@@ -2984,6 +2985,7 @@ async function groqMovieScenes(story, style, language, maxScenes) {
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error((d.error && d.error.message) || 'Groq request failed');
       const txt = d.choices[0].message.content;
+      rawText = txt;
       parsed = parseLooseJson(txt);
       if (parsed && !Array.isArray(parsed.scenes) && Array.isArray(parsed)) parsed = { scenes: parsed };
       if (parsed && parsed.scenes && !Array.isArray(parsed.scenes) && parsed.scenes.scenes) parsed = parsed.scenes;
@@ -2991,7 +2993,27 @@ async function groqMovieScenes(story, style, language, maxScenes) {
       throw new Error('script JSON could not be parsed');
     } catch (e) { lastErr = e; }
   }
-  throw new Error(lastErr ? lastErr.message : 'script generation failed');
+  // last resort: hand the prose back and ask for the JSON alone
+  if (rawText) {
+    try {
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': 'StudioAPI/1.0' },
+        body: JSON.stringify({
+          model: GROQ_MODEL, temperature: 0,
+          messages: [
+            { role: 'system', content: 'Convert the message into ONLY this JSON shape: {"scenes":[{"id":"s1","visualPrompt":"...","narrationText":"..."}]}. No prose, no code fences.' },
+            { role: 'user', content: String(rawText).slice(0, 4000) }
+          ],
+          max_tokens: Math.min(2400, 600 + Math.max(1, target) * 180)
+        })
+      });
+      const d = await r.json().catch(() => ({}));
+      const fixed = parseLooseJson(d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content);
+      if (fixed && Array.isArray(fixed.scenes) && fixed.scenes.length) return fixed;
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error((lastErr ? lastErr.message : 'script generation failed') + (rawText ? ' | model said: ' + String(rawText).replace(/\s+/g, ' ').slice(0, 160) : ' | model said nothing'));
 }
 
 function normalizeScriptScenes(raw) {

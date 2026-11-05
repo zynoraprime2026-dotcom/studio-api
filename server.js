@@ -2984,10 +2984,9 @@ async function groqMovieScenes(story, style, language, maxScenes) {
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error((d.error && d.error.message) || 'Groq request failed');
       const txt = d.choices[0].message.content;
-      try { parsed = JSON.parse(txt); } catch (e) {
-        const m = txt.match(/\{[\s\S]*\}/);
-        if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) {} }
-      }
+      parsed = parseLooseJson(txt);
+      if (parsed && !Array.isArray(parsed.scenes) && Array.isArray(parsed)) parsed = { scenes: parsed };
+      if (parsed && parsed.scenes && !Array.isArray(parsed.scenes) && parsed.scenes.scenes) parsed = parsed.scenes;
       if (parsed && Array.isArray(parsed.scenes) && parsed.scenes.length) return parsed;
       throw new Error('script JSON could not be parsed');
     } catch (e) { lastErr = e; }
@@ -3115,6 +3114,7 @@ function vttTimestamp(s) {
 /** "Kofi: one more seam" is read by a voice, but a caption shows only what is said. */
 const { captionText } = require('./lib/captions');
 const { normalizeBrand, brandCardFilters } = require('./lib/brand');
+const { parseLooseJson } = require('./lib/loose-json');
 
 function buildVtt(cues) {
   return 'WEBVTT\n\n' + cues.map((c, i) =>

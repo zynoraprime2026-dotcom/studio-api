@@ -3985,6 +3985,56 @@ function fireMovieWebhook(movie) {
 // ---------- endpoints ----------
 // POST /v1/movie/draft { prompt, style?, language?, aspectRatio?, scenes?, duration?, character? } -> 1 use
 // Renders nothing and touches no provider: this is the approval gate.
+// POST /v1/film { prompt, quality? } -> one call, one film.
+// The two-step flow (draft, read it, approve) is right when you are deciding what
+// to make. When you already know, it is three screens for one idea: this drafts the
+// shot list, registers it, and starts the render in the same request.
+app.post('/v1/film', async (req, res) => {
+  const b = req.body || {};
+  const prompt = String(b.prompt || b.story || b.idea || '').trim();
+  if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  if (prompt.length > 2000) return res.status(400).json({ error: 'prompt is too long (max 2000 characters)' });
+  const language = String(b.language || 'English').trim().slice(0, 40);
+  const ar = String(b.aspectRatio || b.aspect || '9:16').toLowerCase();
+  const aspect = (ar === '16:9' || ar === 'wide' || ar === 'landscape') ? '16:9' : '9:16';
+  const wanted = parseInt(b.scenes, 10);
+  const scenesWanted = isFinite(wanted) ? Math.min(Math.max(2, wanted), MOVIE_MAX_SCENES) : 4;
+  const quality = ['storyboard', 'standard', 'high'].includes(String(b.quality || '')) ? String(b.quality) : 'storyboard';
+  const style = String(b.style || '').trim().slice(0, 300);
+
+  let scenes = [];
+  try {
+    scenes = normalizeScriptScenes(await retryOnce(() => groqMovieScenes(prompt, style, language, scenesWanted), 3000));
+  } catch (e) {
+    return res.status(502).json({ error: 'script failed: ' + e.message });
+  }
+  if (!scenes.length) return res.status(502).json({ error: 'script produced no usable scenes' });
+
+  const draftId = 'drf_' + crypto.randomUUID();
+  const draft = {
+    title: String(b.title || prompt).trim().slice(0, 80) || 'Untitled film',
+    logline: String(b.logline || '').trim().slice(0, 200),
+    styleBible: style,
+    character: String(b.character || '').trim().slice(0, 300) || null,
+    musicMood: MOVIE_MOODS.includes(String(b.musicMood || '').toLowerCase()) ? String(b.musicMood).toLowerCase() : 'calm',
+    scenes,
+    suggested: { aspectRatio: aspect, language, quality, narratorVoice: movieDefaultVoice(language) }
+  };
+  await mvDraftSave({ id: draftId, key: req.apiKey, prompt, language, draft, createdAt: new Date().toISOString() });
+
+  try {
+    const r = await fetch('http://127.0.0.1:' + (process.env.PORT || 5000) + '/v1/movie/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': req.headers['x-api-key'] || '' },
+      body: JSON.stringify({ draft_id: draftId, quality, title: b.title, language, aspectRatio: aspect })
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.status(r.status).json(Object.assign({ quick: true, quality, shot_list: scenes.map(s => ({ visualPrompt: s.visualPrompt, narrationText: s.narrationText })) }, data));
+  } catch (e) {
+    return res.status(502).json({ error: 'could not start the render: ' + e.message, draft_id: draftId });
+  }
+});
+
 app.post('/v1/movie/draft', async (req, res) => {
   const b = req.body || {};
   const prompt = String(b.prompt || b.idea || b.story || '').trim();

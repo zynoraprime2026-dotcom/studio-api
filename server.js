@@ -1040,6 +1040,21 @@ async function generateImage(opts) {
   // failed still can be diagnosed without shell access to the host.
   const providerErrors = [];
 
+  // The Cloudflare model in use only draws squares, so anything that needs a real frame
+  // (a poster, a thumbnail, a short) goes to Replicate first, which takes an aspect ratio.
+  const wantsShape = Math.abs((w / h) - 1) > 0.01;
+  if (wantsShape && replicateReady) {
+    try {
+      const { buf, mime } = await replicateGenerateImage(basePrompt, w, h, opts.seed);
+      const id = await mediaSave(buf, mime, basePrompt);
+      const dim = imageSize(buf) || { width: w, height: h };
+      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: dim.width, height: dim.height, provider: 'replicate', provider_errors: providerErrors };
+    } catch (e) {
+      console.error('replicate shaped image failed, trying cloudflare:', e.message);
+      providerErrors.push({ provider: 'replicate', error: String(e.message).slice(0, 300) });
+    }
+  }
+
   // Cloudflare first when configured, but a spent quota must not end the request:
   // the error is caught and the paid provider is tried before the keyless host.
   if (cfReady) {

@@ -884,12 +884,36 @@ app.get('/media/video/:id', (req, res) => {
   return fs.createReadStream(file).pipe(res);
 });
 
-// Cloudflare Workers AI: returns { buf, mime }
-async function cfGenerateImage(basePrompt, seed) {
+// Read the real pixel size out of the returned bytes. The workflow and poster callers
+// need to know the frame they actually got, not the one that was asked for.
+function imageSize(buf) {
+  try {
+    if (buf.length > 24 && buf[0] === 0x89 && buf[1] === 0x50) return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+      let i = 2;
+      while (i < buf.length - 9) {
+        if (buf[i] !== 0xff) { i++; continue; }
+        const m = buf[i + 1];
+        const len = buf.readUInt16BE(i + 2);
+        if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+          return { width: buf.readUInt16BE(i + 7), height: buf.readUInt16BE(i + 5) };
+        }
+        i += 2 + len;
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Cloudflare Workers AI: returns { buf, mime, width, height }
+let cfDimsAccepted = true; // flux takes width/height; some other models reject them
+async function cfGenerateImage(basePrompt, seed, wantW, wantH) {
   const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_IMAGE_MODEL}`;
   const seedNum = (seed !== undefined && seed !== null && seed !== '' && Number.isFinite(parseInt(seed))) ? parseInt(seed) : null;
-  const call = async (withSeed) => {
+  const wantsDims = cfDimsAccepted && wantW && wantH && (wantW !== 1024 || wantH !== 1024);
+  const call = async (withSeed, withDims) => {
     const body = { prompt: String(basePrompt).slice(0, 2048), steps: 4 };
+    if (withDims) { body.width = wantW; body.height = wantH; }
     if (withSeed && seedNum !== null) body.seed = seedNum;
     return fetch(url, {
       method: 'POST',
@@ -897,7 +921,7 @@ async function cfGenerateImage(basePrompt, seed) {
       body: JSON.stringify(body)
     });
   };
-  let resp = await call(cfSeedAccepted && seedNum !== null);
+  let resp = await call(cfSeedAccepted && seedNum !== null, wantsDims);
   // flux-1-schnell used to take a seed for cross-scene consistency and then
   // started rejecting the property outright ("/seed at '/' not allowed"), which
   // failed every scene image and left whole films `partial`. Probe once, then stop sending it.
@@ -905,7 +929,16 @@ async function cfGenerateImage(basePrompt, seed) {
     const probe = await resp.clone().text().catch(() => '');
     if (/seed/i.test(probe)) {
       cfSeedAccepted = false;
-      resp = await call(false);
+      resp = await call(false, wantsDims);
+    }
+  }
+  // A model that cannot honour an aspect ratio must not fail the whole picture: drop the
+  // dimensions once and draw square from then on.
+  if (!resp.ok && resp.status === 400 && wantsDims) {
+    const probe = await resp.clone().text().catch(() => '');
+    if (/width|height|dimension|size/i.test(probe)) {
+      cfDimsAccepted = false;
+      resp = await call(cfSeedAccepted && seedNum !== null, false);
     }
   }
   if (!resp.ok) {
@@ -920,11 +953,14 @@ async function cfGenerateImage(basePrompt, seed) {
     const data = await resp.json();
     const b64 = data.image || (data.result && data.result.image);
     if (!b64) throw new Error('Cloudflare Workers AI returned no image data');
-    return { buf: Buffer.from(b64, 'base64'), mime: 'image/jpeg' };
+    const out = Buffer.from(b64, 'base64');
+    const dim = imageSize(out) || { width: wantW || 1024, height: wantH || 1024 };
+    return { buf: out, mime: 'image/jpeg', width: dim.width, height: dim.height };
   }
   const buf = Buffer.from(await resp.arrayBuffer());
   if (!buf.length) throw new Error('Cloudflare Workers AI returned an empty image');
-  return { buf, mime: ct || 'image/jpeg' };
+  const dim = imageSize(buf) || { width: wantW || 1024, height: wantH || 1024 };
+  return { buf, mime: ct || 'image/jpeg', width: dim.width, height: dim.height };
 }
 
 // Replicate stills. Cloudflare Workers AI is the primary image provider, but its free
@@ -1008,9 +1044,9 @@ async function generateImage(opts) {
   // the error is caught and the paid provider is tried before the keyless host.
   if (cfReady) {
     try {
-      const { buf, mime } = await cfGenerateImage(basePrompt, opts.seed);
+      const { buf, mime, width: gotW, height: gotH } = await cfGenerateImage(basePrompt, opts.seed, w, h);
       const id = await mediaSave(buf, mime, basePrompt);
-      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: 1024, height: 1024, provider: 'cloudflare', provider_errors: providerErrors };
+      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: gotW || w, height: gotH || h, provider: 'cloudflare', provider_errors: providerErrors };
     } catch (e) {
       console.error('cloudflare image failed, trying the next provider:', e.message);
       providerErrors.push({ provider: 'cloudflare', error: String(e.message).slice(0, 300) });

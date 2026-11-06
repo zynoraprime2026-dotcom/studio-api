@@ -803,6 +803,41 @@ function reqBase(req) {
   return (String(host).indexOf('localhost') === 0 ? 'http://' : 'https://') + host;
 }
 
+// Cloudflare's model draws squares only, and Replicate needs account credit, so a poster or
+// thumbnail that genuinely needs a tall or wide frame is composed here: the sharp square
+// sits on a blurred, slightly darkened extension of itself. That is how a design tool builds
+// a social template, and it beats stretching or cropping away the edges.
+async function ffmpegRun(args) {
+  try {
+    await execFileAsync('ffmpeg', args, { timeout: 60000, maxBuffer: 1024 * 1024 * 10 });
+  } catch (e) {
+    throw new Error('ffmpeg: ' + String((e.stderr || e.message) || '').slice(-240));
+  }
+}
+
+async function composeFrame(buf, w, h) {
+  const os = require('os');
+  const tag = crypto.randomUUID();
+  const inP = path.join(os.tmpdir(), 'shape-in-' + tag + '.jpg');
+  const outP = path.join(os.tmpdir(), 'shape-out-' + tag + '.jpg');
+  try {
+    fs.writeFileSync(inP, buf);
+    await ffmpegRun([
+      '-y', '-i', inP,
+      '-filter_complex',
+      `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},gblur=sigma=36,eq=brightness=-0.06[bg];` +
+      `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2`,
+      '-frames:v', '1', '-q:v', '2', outP
+    ]);
+    const out = fs.readFileSync(outP);
+    if (!out.length) throw new Error('empty frame');
+    return out;
+  } finally {
+    try { fs.unlinkSync(inP); } catch (e) {}
+    try { fs.unlinkSync(outP); } catch (e) {}
+  }
+}
+
 async function mediaSave(buf, mime, prompt) {
   const id = crypto.randomUUID();
   if (pool && !dbBroken) {
@@ -1060,8 +1095,21 @@ async function generateImage(opts) {
   if (cfReady) {
     try {
       const { buf, mime, width: gotW, height: gotH } = await cfGenerateImage(basePrompt, opts.seed, w, h);
-      const id = await mediaSave(buf, mime, basePrompt);
-      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: gotW || w, height: gotH || h, provider: 'cloudflare', provider_errors: providerErrors };
+      let outBuf = buf;
+      let outW = gotW || w;
+      let outH = gotH || h;
+      if (wantsShape && (outW !== w || outH !== h)) {
+        try {
+          outBuf = await composeFrame(buf, w, h);
+          outW = w; outH = h;
+        } catch (e) {
+          // A failed composition must never lose the picture: the square is still delivered.
+          console.error('frame compose failed, delivering the square:', e.message);
+          providerErrors.push({ provider: 'compose', error: String(e.message).slice(0, 200) });
+        }
+      }
+      const id = await mediaSave(outBuf, 'image/jpeg', basePrompt);
+      return { url: base + '/media/' + id, prompt: basePrompt, preset: resolved ? resolved.name : null, width: outW, height: outH, provider: 'cloudflare', provider_errors: providerErrors };
     } catch (e) {
       console.error('cloudflare image failed, trying the next provider:', e.message);
       providerErrors.push({ provider: 'cloudflare', error: String(e.message).slice(0, 300) });
